@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/mogdb-core",
+    "crates/mogdb-storage",
+    ".",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["MogDB Contributors"]
+license = "MIT"
+repository = "https://github.com/mogdbhq/mogdb"
+
+[workspace.dependencies]
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Types
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Env
+dotenvy = "0.15"
+
+[package]
+name = "mogdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mogdb-storage = { path = "crates/mogdb-storage" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
