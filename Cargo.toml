@@ -47,8 +47,10 @@ license.workspace = true
 
 [dependencies]
 mogdb-storage = { path = "crates/mogdb-storage" }
+mogdb-core = { path = "crates/mogdb-core" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+sqlx = { workspace = true }

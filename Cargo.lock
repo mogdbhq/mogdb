@@ -756,7 +756,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dotenvy",
+ "mogdb-core",
  "mogdb-storage",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
