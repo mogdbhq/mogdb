@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -e
+
+echo "==> cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "==> cargo clippy"
+cargo clippy --workspace -- -D warnings
+
+echo "==> cargo test"
+cargo test --workspace
+
+echo "==> cargo audit"
+cargo audit --ignore RUSTSEC-2023-0071
+
+echo "✓ all checks passed"

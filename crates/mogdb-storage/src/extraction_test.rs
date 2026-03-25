@@ -10,16 +10,28 @@ mod tests {
     #[test]
     fn worst_empty_string() {
         let entities = extract_entities("");
-        assert!(entities.is_empty(), "empty should give no entities: {:?}", entities);
+        assert!(
+            entities.is_empty(),
+            "empty should give no entities: {:?}",
+            entities
+        );
 
         let relations = extract_relations("");
-        assert!(relations.is_empty(), "empty should give no relations: {:?}", relations);
+        assert!(
+            relations.is_empty(),
+            "empty should give no relations: {:?}",
+            relations
+        );
     }
 
     #[test]
     fn worst_all_lowercase_no_entities() {
         let entities = extract_entities("the quick brown fox jumps over the lazy dog");
-        assert!(entities.is_empty(), "should find no entities: {:?}", entities);
+        assert!(
+            entities.is_empty(),
+            "should find no entities: {:?}",
+            entities
+        );
     }
 
     #[test]
@@ -27,8 +39,16 @@ mod tests {
         let entities = extract_entities("使用 PostgreSQL 和 Redis 来构建 🚀🔥");
         // Should still find PostgreSQL and Redis even with unicode around them
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"PostgreSQL"), "should find PostgreSQL in unicode: {:?}", names);
-        assert!(names.contains(&"Redis"), "should find Redis in unicode: {:?}", names);
+        assert!(
+            names.contains(&"PostgreSQL"),
+            "should find PostgreSQL in unicode: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Redis"),
+            "should find Redis in unicode: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -56,7 +76,11 @@ mod tests {
         // Rust might match from "frustration" — this is a known limitation of substring matching
         // The test documents the behavior rather than asserting correctness
         // At minimum should not panic
-        assert!(names.len() <= 3, "should not extract too many false positives: {:?}", names);
+        assert!(
+            names.len() <= 3,
+            "should not extract too many false positives: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -65,13 +89,21 @@ mod tests {
         let entities = extract_entities(&content);
         // Should find PostgreSQL exactly once (deduped), not 5000 times
         let pg_count = entities.iter().filter(|e| e.name == "PostgreSQL").count();
-        assert_eq!(pg_count, 1, "should deduplicate: found {} PostgreSQL entries", pg_count);
+        assert_eq!(
+            pg_count, 1,
+            "should deduplicate: found {} PostgreSQL entries",
+            pg_count
+        );
     }
 
     #[test]
     fn worst_relation_extraction_no_pattern_match() {
         let relations = extract_relations("The weather is nice today");
-        assert!(relations.is_empty(), "unrelated text should give no relations: {:?}", relations);
+        assert!(
+            relations.is_empty(),
+            "unrelated text should give no relations: {:?}",
+            relations
+        );
     }
 
     #[test]
@@ -92,19 +124,36 @@ mod tests {
 
     #[test]
     fn medium_mixed_known_and_unknown_entities() {
-        let entities = extract_entities("We use PostgreSQL on Project Mercury with the Zebra framework");
+        let entities =
+            extract_entities("We use PostgreSQL on Project Mercury with the Zebra framework");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         // Should find PostgreSQL (known) and Project Mercury (proper noun)
-        assert!(names.contains(&"PostgreSQL"), "should find PostgreSQL: {:?}", names);
-        assert!(names.contains(&"Project Mercury"), "should find Project Mercury: {:?}", names);
+        assert!(
+            names.contains(&"PostgreSQL"),
+            "should find PostgreSQL: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Project Mercury"),
+            "should find Project Mercury: {:?}",
+            names
+        );
     }
 
     #[test]
     fn medium_case_insensitive_known_tools() {
         let entities = extract_entities("we deployed on POSTGRESQL and used REDIS for caching");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"PostgreSQL"), "should canonicalize POSTGRESQL: {:?}", names);
-        assert!(names.contains(&"Redis"), "should canonicalize REDIS: {:?}", names);
+        assert!(
+            names.contains(&"PostgreSQL"),
+            "should canonicalize POSTGRESQL: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Redis"),
+            "should canonicalize REDIS: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -112,21 +161,34 @@ mod tests {
         // "google cloud" should match as one entity, not "google" separately
         let entities = extract_entities("We migrated everything to google cloud platform");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Google Cloud"), "should find Google Cloud: {:?}", names);
+        assert!(
+            names.contains(&"Google Cloud"),
+            "should find Google Cloud: {:?}",
+            names
+        );
     }
 
     #[test]
     fn medium_entity_with_punctuation() {
-        let entities = extract_entities("Have you tried Next.js? It's better than React, honestly.");
+        let entities =
+            extract_entities("Have you tried Next.js? It's better than React, honestly.");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Next.js"), "should find Next.js: {:?}", names);
+        assert!(
+            names.contains(&"Next.js"),
+            "should find Next.js: {:?}",
+            names
+        );
         assert!(names.contains(&"React"), "should find React: {:?}", names);
     }
 
     #[test]
     fn medium_relation_with_extra_words() {
         let relations = extract_relations("I recently started using Docker for all my deployments");
-        assert!(!relations.is_empty(), "should find 'started using' relation: {:?}", relations);
+        assert!(
+            !relations.is_empty(),
+            "should find 'started using' relation: {:?}",
+            relations
+        );
         assert_eq!(relations[0].1, "uses");
     }
 
@@ -147,23 +209,46 @@ mod tests {
 
     #[test]
     fn good_multiple_entities_with_relations() {
-        let entities = extract_entities("I switched from AWS to Google Cloud for our backend services");
+        let entities =
+            extract_entities("I switched from AWS to Google Cloud for our backend services");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"AWS"), "should find AWS: {:?}", names);
-        assert!(names.contains(&"Google Cloud"), "should find Google Cloud: {:?}", names);
+        assert!(
+            names.contains(&"Google Cloud"),
+            "should find Google Cloud: {:?}",
+            names
+        );
 
-        let relations = extract_relations("I switched from AWS to Google Cloud for our backend services");
+        let relations =
+            extract_relations("I switched from AWS to Google Cloud for our backend services");
         let rel_types: Vec<&str> = relations.iter().map(|r| r.1.as_str()).collect();
-        assert!(rel_types.contains(&"previously_used"), "should detect previously_used: {:?}", relations);
-        assert!(rel_types.contains(&"uses"), "should detect uses: {:?}", relations);
+        assert!(
+            rel_types.contains(&"previously_used"),
+            "should detect previously_used: {:?}",
+            relations
+        );
+        assert!(
+            rel_types.contains(&"uses"),
+            "should detect uses: {:?}",
+            relations
+        );
     }
 
     #[test]
     fn good_proper_noun_multi_word() {
-        let entities = extract_entities("The team is building Project Phoenix on the Apollo Server");
+        let entities =
+            extract_entities("The team is building Project Phoenix on the Apollo Server");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Project Phoenix"), "should find Project Phoenix: {:?}", names);
-        assert!(names.contains(&"Apollo Server"), "should find Apollo Server: {:?}", names);
+        assert!(
+            names.contains(&"Project Phoenix"),
+            "should find Project Phoenix: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Apollo Server"),
+            "should find Apollo Server: {:?}",
+            names
+        );
     }
 
     // ==================== BEST CASE ====================
@@ -178,17 +263,38 @@ mod tests {
         assert!(names.contains(&"Redis"));
         assert!(names.contains(&"Docker"));
         assert!(names.contains(&"React"));
-        assert_eq!(names.len(), 4, "should find exactly 4 entities: {:?}", names);
+        assert_eq!(
+            names.len(),
+            4,
+            "should find exactly 4 entities: {:?}",
+            names
+        );
     }
 
     #[test]
     fn best_clear_switch_with_relation() {
         let relations = extract_relations("We migrated from MySQL to PostgreSQL last quarter");
-        assert!(relations.len() >= 2, "should find both from and to relations: {:?}", relations);
+        assert!(
+            relations.len() >= 2,
+            "should find both from and to relations: {:?}",
+            relations
+        );
 
-        let has_prev = relations.iter().any(|r| r.1 == "previously_used" && r.2.contains("MySQL"));
-        let has_uses = relations.iter().any(|r| r.1 == "uses" && r.2.contains("PostgreSQL"));
-        assert!(has_prev, "should detect MySQL as previously_used: {:?}", relations);
-        assert!(has_uses, "should detect PostgreSQL as uses: {:?}", relations);
+        let has_prev = relations
+            .iter()
+            .any(|r| r.1 == "previously_used" && r.2.contains("MySQL"));
+        let has_uses = relations
+            .iter()
+            .any(|r| r.1 == "uses" && r.2.contains("PostgreSQL"));
+        assert!(
+            has_prev,
+            "should detect MySQL as previously_used: {:?}",
+            relations
+        );
+        assert!(
+            has_uses,
+            "should detect PostgreSQL as uses: {:?}",
+            relations
+        );
     }
 }

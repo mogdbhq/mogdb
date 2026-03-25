@@ -1,5 +1,4 @@
 /// Entity graph storage — create/lookup entities and relationship edges.
-
 use chrono::{DateTime, Utc};
 use mogdb_core::{Entity, EntityEdge, EntityKind, MogError};
 use sqlx::{FromRow, PgPool};
@@ -36,13 +35,13 @@ impl TryFrom<EntityRow> for Entity {
 
 fn parse_entity_kind(s: &str) -> Result<EntityKind, MogError> {
     match s {
-        "person"  => Ok(EntityKind::Person),
-        "system"  => Ok(EntityKind::System),
+        "person" => Ok(EntityKind::Person),
+        "system" => Ok(EntityKind::System),
         "concept" => Ok(EntityKind::Concept),
         "project" => Ok(EntityKind::Project),
-        "tool"    => Ok(EntityKind::Tool),
-        "other"   => Ok(EntityKind::Other),
-        o         => Err(MogError::InvalidInput(format!("unknown entity kind: {o}"))),
+        "tool" => Ok(EntityKind::Tool),
+        "other" => Ok(EntityKind::Other),
+        o => Err(MogError::InvalidInput(format!("unknown entity kind: {o}"))),
     }
 }
 
@@ -185,17 +184,19 @@ pub async fn get_edges_from(pool: &PgPool, entity_id: Uuid) -> Result<Vec<Entity
 
     Ok(rows
         .into_iter()
-        .map(|(id, from_id, to_id, relation, weight, t_valid, t_invalid, source_memory)| {
-            EntityEdge {
-                id,
-                from_id,
-                to_id,
-                relation,
-                weight,
-                t_valid,
-                t_invalid,
-                source_memory,
-            }
-        })
+        .map(
+            |(id, from_id, to_id, relation, weight, t_valid, t_invalid, source_memory)| {
+                EntityEdge {
+                    id,
+                    from_id,
+                    to_id,
+                    relation,
+                    weight,
+                    t_valid,
+                    t_invalid,
+                    source_memory,
+                }
+            },
+        )
         .collect())
 }

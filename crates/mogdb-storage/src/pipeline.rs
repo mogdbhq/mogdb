@@ -1,7 +1,6 @@
 /// The full write pipeline — orchestrates extraction, scoring, conflict
 /// detection, entity graph updates, and storage into a single `ingest()` call.
-
-use mogdb_core::{MemoryKind, MemoryRecord, NewMemoryRecord, SourceTrust, MogError};
+use mogdb_core::{MemoryKind, MemoryRecord, MogError, NewMemoryRecord, SourceTrust};
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
@@ -62,7 +61,8 @@ pub async fn ingest(
     // Step 4: Detect and invalidate conflicts (skip for quarantined memories)
     let mut conflicts_invalidated = 0u64;
     if !quarantined {
-        let candidates = conflict::find_conflicts(pool, agent_id, user_id, content, &entity_names).await?;
+        let candidates =
+            conflict::find_conflicts(pool, agent_id, user_id, content, &entity_names).await?;
 
         if !candidates.is_empty() {
             debug!("found {} conflict candidates", candidates.len());
@@ -80,7 +80,8 @@ pub async fn ingest(
                 })
                 .collect();
 
-            conflicts_invalidated = conflict::invalidate_conflicts(pool, agent_id, &conflict_ids).await?;
+            conflicts_invalidated =
+                conflict::invalidate_conflicts(pool, agent_id, &conflict_ids).await?;
         }
     }
 
@@ -105,8 +106,7 @@ pub async fn ingest(
     if !quarantined {
         // Create/update entity nodes
         for ext in &extracted {
-            let _entity_id =
-                entity::upsert(pool, agent_id, user_id, &ext.name, &ext.kind).await?;
+            let _entity_id = entity::upsert(pool, agent_id, user_id, &ext.name, &ext.kind).await?;
             entities_touched.push(ext.name.clone());
         }
 
@@ -121,11 +121,9 @@ pub async fn ingest(
             };
 
             // Try to find the object entity among our extracted entities
-            let obj_entity = extracted.iter().find(|e| {
-                object_hint
-                    .to_lowercase()
-                    .contains(&e.name.to_lowercase())
-            });
+            let obj_entity = extracted
+                .iter()
+                .find(|e| object_hint.to_lowercase().contains(&e.name.to_lowercase()));
 
             if let Some(obj) = obj_entity {
                 let subj_id = entity::upsert(
@@ -136,8 +134,7 @@ pub async fn ingest(
                     &mogdb_core::EntityKind::Person,
                 )
                 .await?;
-                let obj_id =
-                    entity::upsert(pool, agent_id, user_id, &obj.name, &obj.kind).await?;
+                let obj_id = entity::upsert(pool, agent_id, user_id, &obj.name, &obj.kind).await?;
 
                 // If this is a "previously_used" relation, invalidate existing "uses" edges
                 if relation == "previously_used" || relation == "stopped_using" {

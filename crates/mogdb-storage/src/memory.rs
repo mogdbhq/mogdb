@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use mogdb_core::{AuditAction, MogError, MemoryKind, MemoryRecord, NewMemoryRecord, SourceTrust};
+use mogdb_core::{AuditAction, MemoryKind, MemoryRecord, MogError, NewMemoryRecord, SourceTrust};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
@@ -57,21 +57,25 @@ impl TryFrom<MemoryRow> for MemoryRecord {
 
 fn parse_kind(s: &str) -> Result<MemoryKind, MogError> {
     match s {
-        "episodic"   => Ok(MemoryKind::Episodic),
-        "semantic"   => Ok(MemoryKind::Semantic),
+        "episodic" => Ok(MemoryKind::Episodic),
+        "semantic" => Ok(MemoryKind::Semantic),
         "procedural" => Ok(MemoryKind::Procedural),
-        "working"    => Ok(MemoryKind::Working),
-        other        => Err(MogError::InvalidInput(format!("unknown memory kind: {other}"))),
+        "working" => Ok(MemoryKind::Working),
+        other => Err(MogError::InvalidInput(format!(
+            "unknown memory kind: {other}"
+        ))),
     }
 }
 
 fn parse_source_trust(s: &str) -> Result<SourceTrust, MogError> {
     match s {
-        "agent"    => Ok(SourceTrust::Agent),
-        "user"     => Ok(SourceTrust::User),
-        "system"   => Ok(SourceTrust::System),
+        "agent" => Ok(SourceTrust::Agent),
+        "user" => Ok(SourceTrust::User),
+        "system" => Ok(SourceTrust::System),
         "external" => Ok(SourceTrust::External),
-        other      => Err(MogError::InvalidInput(format!("unknown source trust: {other}"))),
+        other => Err(MogError::InvalidInput(format!(
+            "unknown source trust: {other}"
+        ))),
     }
 }
 
@@ -124,14 +128,29 @@ pub async fn store(pool: &PgPool, input: NewMemoryRecord) -> Result<MemoryRecord
     .execute(pool)
     .await?;
 
-    audit::log(pool, AuditAction::Write, &input.agent_id, Some(id), None, None).await?;
+    audit::log(
+        pool,
+        AuditAction::Write,
+        &input.agent_id,
+        Some(id),
+        None,
+        None,
+    )
+    .await?;
 
     fetch_by_id(pool, id, &input.agent_id).await
 }
 
 /// Fetch a single memory record by ID, scoped to agent.
-pub async fn fetch_by_id(pool: &PgPool, id: Uuid, agent_id: &str) -> Result<MemoryRecord, MogError> {
-    let sql = format!("SELECT {} FROM memory_records WHERE id = $1 AND agent_id = $2", SELECT_FIELDS);
+pub async fn fetch_by_id(
+    pool: &PgPool,
+    id: Uuid,
+    agent_id: &str,
+) -> Result<MemoryRecord, MogError> {
+    let sql = format!(
+        "SELECT {} FROM memory_records WHERE id = $1 AND agent_id = $2",
+        SELECT_FIELDS
+    );
 
     let row = sqlx::query_as::<_, MemoryRow>(&sql)
         .bind(id)
@@ -177,7 +196,15 @@ pub async fn invalidate(pool: &PgPool, id: Uuid, agent_id: &str) -> Result<(), M
         return Err(MogError::NotFound(id.to_string()));
     }
 
-    audit::log(pool, AuditAction::Invalidate, agent_id, Some(id), None, None).await?;
+    audit::log(
+        pool,
+        AuditAction::Invalidate,
+        agent_id,
+        Some(id),
+        None,
+        None,
+    )
+    .await?;
     Ok(())
 }
 

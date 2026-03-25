@@ -139,7 +139,11 @@ pub struct NewMemoryRecord {
 }
 
 impl NewMemoryRecord {
-    pub fn new(agent_id: impl Into<String>, user_id: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn new(
+        agent_id: impl Into<String>,
+        user_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self {
             agent_id: agent_id.into(),
             user_id: user_id.into(),

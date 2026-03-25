@@ -22,7 +22,10 @@ mod tests {
     #[test]
     fn worst_only_whitespace() {
         let score = score_importance("     \n\t  ", false);
-        assert!(score <= 0.5, "whitespace-only should score low, got {score}");
+        assert!(
+            score <= 0.5,
+            "whitespace-only should score low, got {score}"
+        );
     }
 
     #[test]
@@ -44,7 +47,10 @@ mod tests {
         // Has both high ("always") and low ("maybe") signals
         let score = score_importance("maybe you should always do this", false);
         // Both signals fire — net effect should be some middle ground
-        assert!(score >= 0.3 && score <= 0.9, "conflicting signals: got {score}");
+        assert!(
+            score >= 0.3 && score <= 0.9,
+            "conflicting signals: got {score}"
+        );
     }
 
     #[test]
@@ -56,7 +62,10 @@ mod tests {
         // Both will score high due to "must" matching — this is a known limitation
         // At minimum neither should panic
         assert!(score_mustard >= 0.1, "mustard: got {score_mustard}");
-        assert!(score_actual_must >= 0.1, "actual must: got {score_actual_must}");
+        assert!(
+            score_actual_must >= 0.1,
+            "actual must: got {score_actual_must}"
+        );
     }
 
     #[test]
@@ -70,7 +79,10 @@ mod tests {
     #[test]
     fn medium_neutral_statement() {
         let score = score_importance("The deployment completed at 3pm yesterday", false);
-        assert!((0.35..=0.6).contains(&score), "neutral statement: got {score}");
+        assert!(
+            (0.35..=0.6).contains(&score),
+            "neutral statement: got {score}"
+        );
     }
 
     #[test]
@@ -90,20 +102,29 @@ mod tests {
     fn medium_implicit_preference_no_keyword() {
         // This IS a preference but has no preference keywords
         let score = score_importance("I write all my code in Rust these days", false);
-        assert!((0.35..=0.6).contains(&score), "implicit preference: got {score}");
+        assert!(
+            (0.35..=0.6).contains(&score),
+            "implicit preference: got {score}"
+        );
     }
 
     // ==================== GOOD CASE ====================
 
     #[test]
     fn good_clear_preference() {
-        let score = score_importance("I prefer using TypeScript over JavaScript for new projects", false);
+        let score = score_importance(
+            "I prefer using TypeScript over JavaScript for new projects",
+            false,
+        );
         assert!(score >= 0.6, "clear preference: got {score}");
     }
 
     #[test]
     fn good_switched_to() {
-        let score = score_importance("We switched to Kubernetes last quarter for all deployments", false);
+        let score = score_importance(
+            "We switched to Kubernetes last quarter for all deployments",
+            false,
+        );
         assert!(score >= 0.6, "switched to: got {score}");
     }
 
@@ -124,14 +145,23 @@ mod tests {
 
     #[test]
     fn best_critical_rule() {
-        let score = score_importance("You must always run the test suite before deploying to production", false);
+        let score = score_importance(
+            "You must always run the test suite before deploying to production",
+            false,
+        );
         assert!(score >= 0.75, "critical rule: got {score}");
     }
 
     #[test]
     fn best_multiple_high_signals() {
         // "always" + "must" + "important" — all high signals but score capped at 1.0
-        let score = score_importance("It is critically important that you must always verify credentials", false);
-        assert!(score >= 0.75 && score <= 1.0, "multiple high signals: got {score}");
+        let score = score_importance(
+            "It is critically important that you must always verify credentials",
+            false,
+        );
+        assert!(
+            score >= 0.75 && score <= 1.0,
+            "multiple high signals: got {score}"
+        );
     }
 }

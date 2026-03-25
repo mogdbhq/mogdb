@@ -93,16 +93,18 @@ mod tests {
 
     #[test]
     fn medium_same_verb_different_context() {
-        // Both say "uses" but could be about different use cases
-        // Our heuristic is aggressive — it WILL flag this as a contradiction
+        // Both say "uses" but about different use cases.
+        // Known false positive: same verb + shared entities = conflict.
+        // Will be resolved in Phase 2 with semantic similarity scoring.
         let result = is_contradicting(
             "team uses PostgreSQL for the main database",
             "team uses Redis for caching",
             &["PostgreSQL".to_string(), "Redis".to_string()],
         );
-        // This IS a false positive — both can be true simultaneously
-        // Documenting this known limitation
-        assert!(result, "known false positive: same verb + shared entities = conflict");
+        assert!(
+            result,
+            "known false positive: same verb + shared entities = conflict"
+        );
     }
 
     #[test]

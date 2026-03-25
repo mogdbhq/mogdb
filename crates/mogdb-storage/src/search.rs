@@ -1,8 +1,7 @@
 /// Query Planner — hybrid search across full-text, temporal, and graph indexes.
 /// Results are merged using Reciprocal Rank Fusion (RRF).
-
 use chrono::{DateTime, Utc};
-use mogdb_core::{AuditAction, MogError, MemoryKind};
+use mogdb_core::{AuditAction, MemoryKind, MogError};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
@@ -29,7 +28,11 @@ pub struct SearchQuery {
 }
 
 impl SearchQuery {
-    pub fn new(agent_id: impl Into<String>, user_id: impl Into<String>, query: impl Into<String>) -> Self {
+    pub fn new(
+        agent_id: impl Into<String>,
+        user_id: impl Into<String>,
+        query: impl Into<String>,
+    ) -> Self {
         Self {
             agent_id: agent_id.into(),
             user_id: user_id.into(),
@@ -129,12 +132,17 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
     // Step 4: Graph expansion (if requested)
     if query.include_graph {
         for result in &mut results {
-            result.graph_context = expand_graph(pool, &query.agent_id, &query.user_id, &result.entity_refs).await?;
+            result.graph_context =
+                expand_graph(pool, &query.agent_id, &query.user_id, &result.entity_refs).await?;
         }
     }
 
     // Step 5: Sort by final score descending, apply limit
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(query.limit as usize);
 
     // Step 6: Bump access_count for returned memories
@@ -156,12 +164,16 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
 }
 
 /// Full-text search with temporal + kind + strength filtering baked into SQL.
-async fn fts_search(pool: &PgPool, query: &SearchQuery, tsquery: &str) -> Result<Vec<FtsRow>, MogError> {
+async fn fts_search(
+    pool: &PgPool,
+    query: &SearchQuery,
+    tsquery: &str,
+) -> Result<Vec<FtsRow>, MogError> {
     // Build the temporal clause
     let temporal_clause = match query.as_of {
-        Some(ref ts) => format!(
-            "AND t_valid <= '{ts}' AND (t_invalid IS NULL OR t_invalid > '{ts}')"
-        ),
+        Some(ref ts) => {
+            format!("AND t_valid <= '{ts}' AND (t_invalid IS NULL OR t_invalid > '{ts}')")
+        }
         None => "AND t_invalid IS NULL".to_string(),
     };
 
@@ -306,12 +318,14 @@ async fn expand_graph(
 
     Ok(rows
         .into_iter()
-        .map(|(entity_name, entity_kind, relation, related_to)| GraphNode {
-            entity_name,
-            entity_kind,
-            relation,
-            related_to,
-        })
+        .map(
+            |(entity_name, entity_kind, relation, related_to)| GraphNode {
+                entity_name,
+                entity_kind,
+                relation,
+                related_to,
+            },
+        )
         .collect())
 }
 
@@ -335,15 +349,13 @@ async fn touch_accessed(pool: &PgPool, ids: &[Uuid]) -> Result<(), MogError> {
 /// Splits into words, removes stop words, joins with OR operator.
 fn build_tsquery(text: &str) -> String {
     const STOP_WORDS: &[&str] = &[
-        "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
-        "they", "them", "the", "a", "an", "is", "are", "was", "were",
-        "be", "been", "being", "have", "has", "had", "do", "does", "did",
-        "will", "would", "could", "should", "may", "might", "can",
-        "and", "but", "or", "not", "no", "so", "if", "then", "what",
-        "in", "on", "at", "to", "for", "of", "with", "from", "by",
-        "this", "that", "these", "those", "here", "there", "how", "when",
-        "also", "just", "very", "really", "actually", "now", "last",
-        "about", "which", "who", "where", "why",
+        "i", "me", "my", "we", "our", "you", "your", "he", "she", "it", "they", "them", "the", "a",
+        "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do",
+        "does", "did", "will", "would", "could", "should", "may", "might", "can", "and", "but",
+        "or", "not", "no", "so", "if", "then", "what", "in", "on", "at", "to", "for", "of", "with",
+        "from", "by", "this", "that", "these", "those", "here", "there", "how", "when", "also",
+        "just", "very", "really", "actually", "now", "last", "about", "which", "who", "where",
+        "why",
     ];
 
     let terms: Vec<String> = text
@@ -392,19 +404,37 @@ mod tests {
     fn fuse_results_scores_decrease() {
         let rows = vec![
             FtsRow {
-                id: Uuid::new_v4(), content: "first".into(), kind: "semantic".into(),
-                importance: 0.9, strength: 1.0, t_valid: Utc::now(), t_invalid: None,
-                t_created: Utc::now(), entity_refs: vec![], rank: 0.8,
+                id: Uuid::new_v4(),
+                content: "first".into(),
+                kind: "semantic".into(),
+                importance: 0.9,
+                strength: 1.0,
+                t_valid: Utc::now(),
+                t_invalid: None,
+                t_created: Utc::now(),
+                entity_refs: vec![],
+                rank: 0.8,
             },
             FtsRow {
-                id: Uuid::new_v4(), content: "second".into(), kind: "semantic".into(),
-                importance: 0.5, strength: 0.7, t_valid: Utc::now(), t_invalid: None,
-                t_created: Utc::now(), entity_refs: vec![], rank: 0.3,
+                id: Uuid::new_v4(),
+                content: "second".into(),
+                kind: "semantic".into(),
+                importance: 0.5,
+                strength: 0.7,
+                t_valid: Utc::now(),
+                t_invalid: None,
+                t_created: Utc::now(),
+                entity_refs: vec![],
+                rank: 0.3,
             },
         ];
 
         let results = fuse_results(rows);
-        assert!(results[0].score > results[1].score,
-            "first should score higher: {} vs {}", results[0].score, results[1].score);
+        assert!(
+            results[0].score > results[1].score,
+            "first should score higher: {} vs {}",
+            results[0].score,
+            results[1].score
+        );
     }
 }

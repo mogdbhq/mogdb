@@ -1,6 +1,5 @@
 /// Rule-based importance scoring for memory records.
 /// Phase 1: keyword heuristics. Later phases add LLM-based scoring.
-
 /// Score a piece of text for importance. Returns 0.0–1.0.
 pub fn score_importance(content: &str, is_procedural: bool) -> f64 {
     if is_procedural {
@@ -12,22 +11,49 @@ pub fn score_importance(content: &str, is_procedural: bool) -> f64 {
 
     // Strong directive keywords → high importance
     const HIGH_SIGNALS: &[&str] = &[
-        "always", "never", "must", "do not", "don't", "important",
-        "critical", "require", "mandatory", "forbidden", "rule",
-        "ensure", "absolutely", "strictly",
+        "always",
+        "never",
+        "must",
+        "do not",
+        "don't",
+        "important",
+        "critical",
+        "require",
+        "mandatory",
+        "forbidden",
+        "rule",
+        "ensure",
+        "absolutely",
+        "strictly",
     ];
 
     // Preference keywords → medium-high importance
     const MEDIUM_SIGNALS: &[&str] = &[
-        "prefer", "hate", "love", "like", "dislike", "want",
-        "switched to", "moved to", "changed to", "use instead",
-        "stop using", "started using", "favorite", "favourite",
+        "prefer",
+        "hate",
+        "love",
+        "like",
+        "dislike",
+        "want",
+        "switched to",
+        "moved to",
+        "changed to",
+        "use instead",
+        "stop using",
+        "started using",
+        "favorite",
+        "favourite",
     ];
 
     // Low-signal content → reduce importance
     const LOW_SIGNALS: &[&str] = &[
-        "maybe", "might", "not sure", "i think", "possibly",
-        "sometimes", "occasionally",
+        "maybe",
+        "might",
+        "not sure",
+        "i think",
+        "possibly",
+        "sometimes",
+        "occasionally",
     ];
 
     for kw in HIGH_SIGNALS {

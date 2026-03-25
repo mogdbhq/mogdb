@@ -1,6 +1,5 @@
 /// Rule-based entity extraction from text.
 /// Phase 1: pattern + keyword heuristics. Later phases add LLM extraction.
-
 use mogdb_core::EntityKind;
 
 /// An extracted entity from text, before DB lookup/creation.
@@ -98,7 +97,10 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
     for (name, kind) in sorted_known {
         if lower.contains(name) {
             let canonical = canonicalize(name);
-            if !found.iter().any(|e| e.name.eq_ignore_ascii_case(&canonical)) {
+            if !found
+                .iter()
+                .any(|e| e.name.eq_ignore_ascii_case(&canonical))
+            {
                 found.push(ExtractedEntity {
                     name: canonical,
                     kind: kind.clone(),
@@ -112,7 +114,8 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let mut i = 0;
     while i < words.len() {
-        if starts_with_upper(words[i]) && !is_sentence_start(i, &words) && !is_common_word(words[i]) {
+        if starts_with_upper(words[i]) && !is_sentence_start(i, &words) && !is_common_word(words[i])
+        {
             // Collect consecutive capitalized words
             let start = i;
             while i < words.len() && starts_with_upper(words[i]) && !is_common_word(words[i]) {
@@ -120,7 +123,9 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
             }
             if i - start >= 1 {
                 let phrase: String = words[start..i].join(" ");
-                let clean = phrase.trim_matches(|c: char| c.is_ascii_punctuation()).to_string();
+                let clean = phrase
+                    .trim_matches(|c: char| c.is_ascii_punctuation())
+                    .to_string();
                 if clean.len() >= 2
                     && !found.iter().any(|e| e.name.eq_ignore_ascii_case(&clean))
                     && !is_known_tool_name(&clean)
@@ -159,14 +164,19 @@ pub fn extract_relations(text: &str) -> Vec<(String, String, String)> {
     ];
 
     // Special compound pattern: "switched/moved/changed from X to Y"
-    let from_to_patterns = ["switched from", "moved from", "changed from", "migrated from"];
+    let from_to_patterns = [
+        "switched from",
+        "moved from",
+        "changed from",
+        "migrated from",
+    ];
     for pattern in from_to_patterns {
         if let Some(pos) = lower.find(pattern) {
             let after = &text[pos + pattern.len()..];
             if let Some(to_pos) = after.to_lowercase().find(" to ") {
                 let from_obj = after[..to_pos].trim().to_string();
                 let to_obj = after[to_pos + 4..]
-                    .split(|c: char| c == '.' || c == ',' || c == ';' || c == '\n')
+                    .split(['.', ',', ';', '\n'])
                     .next()
                     .unwrap_or("")
                     .trim()
@@ -180,7 +190,7 @@ pub fn extract_relations(text: &str) -> Vec<(String, String, String)> {
             } else {
                 // No "to" clause — just the "from" part
                 let from_obj = after
-                    .split(|c: char| c == '.' || c == ',' || c == ';' || c == '\n')
+                    .split(['.', ',', ';', '\n'])
                     .next()
                     .unwrap_or("")
                     .trim()
@@ -200,7 +210,7 @@ pub fn extract_relations(text: &str) -> Vec<(String, String, String)> {
         if let Some(pos) = lower.find(pattern) {
             let after = &text[pos + pattern.len()..];
             let object: String = after
-                .split(|c: char| c == '.' || c == ',' || c == ';' || c == '\n')
+                .split(['.', ',', ';', '\n'])
                 .next()
                 .unwrap_or("")
                 .trim()
@@ -246,14 +256,11 @@ fn is_sentence_start(idx: usize, words: &[&str]) -> bool {
 
 fn is_common_word(word: &str) -> bool {
     const COMMON: &[&str] = &[
-        "I", "The", "This", "That", "It", "We", "They", "He", "She",
-        "My", "Our", "Your", "His", "Her", "Its", "Their",
-        "A", "An", "And", "But", "Or", "Not", "No", "Yes",
-        "If", "When", "Then", "So", "As", "In", "On", "At", "To", "For",
-        "Is", "Are", "Was", "Were", "Be", "Been", "Being",
-        "Have", "Has", "Had", "Do", "Does", "Did",
-        "Can", "Could", "Will", "Would", "Should", "May", "Might",
-        "Also", "Just", "Only", "Very", "Really", "Actually",
+        "I", "The", "This", "That", "It", "We", "They", "He", "She", "My", "Our", "Your", "His",
+        "Her", "Its", "Their", "A", "An", "And", "But", "Or", "Not", "No", "Yes", "If", "When",
+        "Then", "So", "As", "In", "On", "At", "To", "For", "Is", "Are", "Was", "Were", "Be",
+        "Been", "Being", "Have", "Has", "Had", "Do", "Does", "Did", "Can", "Could", "Will",
+        "Would", "Should", "May", "Might", "Also", "Just", "Only", "Very", "Really", "Actually",
     ];
     let clean = word.trim_matches(|c: char| c.is_ascii_punctuation());
     COMMON.iter().any(|c| c.eq_ignore_ascii_case(clean))

@@ -9,11 +9,11 @@ pub mod scoring;
 pub mod search;
 
 #[cfg(test)]
-mod scoring_test;
+mod conflict_test;
 #[cfg(test)]
 mod extraction_test;
 #[cfg(test)]
-mod conflict_test;
+mod scoring_test;
 
 pub use db::Database;
 pub use pipeline::{ingest, IngestResult};

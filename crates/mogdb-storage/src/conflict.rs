@@ -1,6 +1,5 @@
 /// Conflict detection — find existing memories that contradict an incoming fact
 /// and invalidate them (set t_invalid = now, not delete).
-
 use chrono::{DateTime, Utc};
 use mogdb_core::MogError;
 use sqlx::PgPool;
@@ -89,13 +88,15 @@ pub async fn find_conflicts(
 
     Ok(candidates
         .into_iter()
-        .map(|(id, content, t_valid, importance, rank)| ConflictCandidate {
-            id,
-            content,
-            t_valid,
-            importance,
-            rank,
-        })
+        .map(
+            |(id, content, t_valid, importance, rank)| ConflictCandidate {
+                id,
+                content,
+                t_valid,
+                importance,
+                rank,
+            },
+        )
         .collect())
 }
 
@@ -125,12 +126,12 @@ pub fn is_contradicting(existing: &str, incoming: &str, shared_entities: &[Strin
         let ex_has = ex_lower.contains(verb);
         let in_has = in_lower.contains(verb);
         if ex_has && in_has {
-            // Same verb used in both — likely a preference change
             return true;
         }
     }
 
-    // Pattern: "switched from X" / "moved from X" in incoming implies old fact is invalid
+    // Pattern: "switched from X" / "moved from X" in incoming implies old fact is invalid.
+    // The existing memory must actually mention the entity being switched from.
     let switch_patterns = [
         "switched from",
         "moved from",
@@ -142,9 +143,11 @@ pub fn is_contradicting(existing: &str, incoming: &str, shared_entities: &[Strin
     ];
     for pattern in switch_patterns {
         if in_lower.contains(pattern) {
-            // Check if any shared entity is mentioned after the "from"
             for entity in shared_entities {
-                if in_lower.contains(&format!("{} {}", pattern, entity.to_lowercase())) {
+                let entity_lower = entity.to_lowercase();
+                if in_lower.contains(&format!("{} {}", pattern, entity_lower))
+                    && ex_lower.contains(&entity_lower)
+                {
                     return true;
                 }
             }
@@ -213,14 +216,12 @@ pub async fn invalidate_conflicts(
 /// Extract meaningful search terms from text, filtering out stop words.
 fn extract_search_terms(text: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
-        "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
-        "they", "them", "the", "a", "an", "is", "are", "was", "were",
-        "be", "been", "being", "have", "has", "had", "do", "does", "did",
-        "will", "would", "could", "should", "may", "might", "can",
-        "and", "but", "or", "not", "no", "so", "if", "then",
-        "in", "on", "at", "to", "for", "of", "with", "from", "by",
-        "this", "that", "these", "those", "here", "there",
-        "also", "just", "very", "really", "actually", "now", "last",
+        "i", "me", "my", "we", "our", "you", "your", "he", "she", "it", "they", "them", "the", "a",
+        "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do",
+        "does", "did", "will", "would", "could", "should", "may", "might", "can", "and", "but",
+        "or", "not", "no", "so", "if", "then", "in", "on", "at", "to", "for", "of", "with", "from",
+        "by", "this", "that", "these", "those", "here", "there", "also", "just", "very", "really",
+        "actually", "now", "last",
     ];
 
     text.split(|c: char| !c.is_alphanumeric())
