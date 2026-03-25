@@ -7,5 +7,12 @@ pub mod memory;
 pub mod pipeline;
 pub mod scoring;
 
+#[cfg(test)]
+mod scoring_test;
+#[cfg(test)]
+mod extraction_test;
+#[cfg(test)]
+mod conflict_test;
+
 pub use db::Database;
 pub use pipeline::{ingest, IngestResult};

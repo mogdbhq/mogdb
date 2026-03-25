@@ -106,8 +106,18 @@ pub fn is_contradicting(existing: &str, incoming: &str, shared_entities: &[Strin
         return false;
     }
 
+    // Identical content is never a contradiction
+    if existing == incoming {
+        return false;
+    }
+
     let ex_lower = existing.to_lowercase();
     let in_lower = incoming.to_lowercase();
+
+    // Case-insensitive identical is also not a contradiction
+    if ex_lower == in_lower {
+        return false;
+    }
 
     // Pattern: "uses X" vs "uses Y" (same verb, different object, same entity context)
     let preference_verbs = ["uses", "prefers", "likes", "wants", "runs", "deployed on"];
