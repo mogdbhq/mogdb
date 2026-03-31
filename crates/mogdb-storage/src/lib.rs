@@ -1,9 +1,11 @@
 pub mod audit;
 pub mod conflict;
 pub mod db;
+pub mod decay;
 pub mod embedding;
 pub mod entity;
 pub mod extraction;
+pub mod forget;
 pub mod memory;
 pub mod pipeline;
 pub mod scoring;

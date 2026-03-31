@@ -234,6 +234,57 @@ pub enum AuditAction {
     Quarantine,
 }
 
+/// A declarative rule that describes which memories to act on during the nightly
+/// forget pass. Stored in the `forget_policies` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgetPolicy {
+    pub id: Uuid,
+    pub agent_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub condition: PolicyCondition,
+    pub action: PolicyAction,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Filters which memories a ForgetPolicy applies to.
+/// All fields are optional — omit a field to skip that filter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicyCondition {
+    /// Only apply to memories of this kind.
+    pub kind: Option<MemoryKind>,
+    /// Only apply if `strength` is below this threshold.
+    pub strength_below: Option<f64>,
+    /// Only apply if the memory is older than this many days (based on `t_created`).
+    pub older_than_days: Option<u32>,
+    /// Only apply if `access_count` is below this value.
+    pub access_count_below: Option<i32>,
+}
+
+/// What to do when a ForgetPolicy condition is satisfied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyAction {
+    /// Soft-delete the memory by setting `t_expired = NOW()`.
+    Expire,
+    /// Mark the fact as no longer true by setting `t_invalid = NOW()`.
+    Invalidate,
+    /// Move the memory to the quarantine queue for human review.
+    Quarantine,
+}
+
+impl std::fmt::Display for PolicyAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PolicyAction::Expire => write!(f, "expire"),
+            PolicyAction::Invalidate => write!(f, "invalidate"),
+            PolicyAction::Quarantine => write!(f, "quarantine"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

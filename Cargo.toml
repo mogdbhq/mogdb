@@ -2,6 +2,7 @@
 members = [
     "crates/mogdb-core",
     "crates/mogdb-storage",
+    "crates/mogdb-workers",
     ".",
 ]
 resolver = "2"
@@ -43,6 +44,10 @@ dotenvy = "0.15"
 reqwest = { version = "0.12", features = ["json"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 
+# Metrics
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", features = ["http-listener"] }
+
 [package]
 name = "mogdb"
 version.workspace = true
@@ -51,6 +56,7 @@ license.workspace = true
 
 [dependencies]
 mogdb-storage = { path = "crates/mogdb-storage" }
+mogdb-workers = { path = "crates/mogdb-workers" }
 mogdb-core = { path = "crates/mogdb-core" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -60,3 +66,5 @@ dotenvy = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
