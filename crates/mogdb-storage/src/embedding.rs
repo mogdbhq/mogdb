@@ -20,6 +20,7 @@ pub trait EmbeddingProvider: Send + Sync {
 /// Pull a model first: `ollama pull mxbai-embed-large`
 ///
 /// The default base URL is `http://localhost:11434`. Override with `OLLAMA_HOST`.
+#[derive(Clone)]
 pub struct OllamaEmbeddings {
     client: reqwest::Client,
     base_url: String,

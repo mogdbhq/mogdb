@@ -73,7 +73,7 @@ impl SearchQuery {
 }
 
 /// A single search result with scoring metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub id: Uuid,
     pub content: String,
@@ -91,7 +91,7 @@ pub struct SearchResult {
 }
 
 /// An entity node returned as graph context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GraphNode {
     pub entity_name: String,
     pub entity_kind: String,

@@ -48,6 +48,10 @@ pgvector = { version = "0.4", features = ["sqlx"] }
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", features = ["http-listener"] }
 
+# HTTP API
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
 [package]
 name = "mogdb"
 version.workspace = true
@@ -68,3 +72,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
