@@ -39,6 +39,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Env
 dotenvy = "0.15"
 
+# Embeddings / HTTP
+reqwest = { version = "0.12", features = ["json"] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+
 [package]
 name = "mogdb"
 version.workspace = true

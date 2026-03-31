@@ -4,7 +4,7 @@ use mogdb_core::{MemoryKind, MemoryRecord, MogError, NewMemoryRecord, SourceTrus
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
-use crate::{conflict, entity, extraction, memory, scoring};
+use crate::{conflict, embedding::EmbeddingProvider, entity, extraction, memory, scoring};
 
 /// Result of ingesting a memory — includes what happened during the pipeline.
 #[derive(Debug)]
@@ -168,4 +168,46 @@ pub async fn ingest(
         entities_touched,
         quarantined,
     })
+}
+
+/// Same as `ingest()` but also generates and stores an embedding vector.
+/// The embedding is generated after the record is stored, so a storage failure
+/// never leaves an orphaned vector.
+#[allow(clippy::too_many_arguments)]
+pub async fn ingest_with_embedder<E: EmbeddingProvider>(
+    pool: &PgPool,
+    agent_id: &str,
+    user_id: &str,
+    content: &str,
+    kind: MemoryKind,
+    source_trust: SourceTrust,
+    session_id: Option<&str>,
+    embedder: &E,
+) -> Result<IngestResult, MogError> {
+    let result = ingest(
+        pool,
+        agent_id,
+        user_id,
+        content,
+        kind,
+        source_trust,
+        session_id,
+    )
+    .await?;
+
+    // Skip embedding for quarantined memories — they're unreviewed external content.
+    if !result.quarantined {
+        match embedder.embed(content).await {
+            Ok(vec) => {
+                memory::store_embedding(pool, result.memory.id, vec).await?;
+                debug!(id = %result.memory.id, "stored embedding");
+            }
+            Err(e) => {
+                // Embedding failure is non-fatal: the memory is stored, just without a vector.
+                warn!(id = %result.memory.id, error = %e, "embedding generation failed — memory stored without vector");
+            }
+        }
+    }
+
+    Ok(result)
 }

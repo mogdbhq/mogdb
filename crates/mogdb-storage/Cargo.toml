@@ -16,3 +16,5 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+reqwest = { workspace = true }
+pgvector = { workspace = true }

@@ -13,4 +13,7 @@ pub enum MogError {
 
     #[error("conflict detected: {0}")]
     Conflict(String),
+
+    #[error("external service error: {0}")]
+    External(String),
 }

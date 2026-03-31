@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use mogdb_core::{AuditAction, MemoryKind, MemoryRecord, MogError, NewMemoryRecord, SourceTrust};
+use pgvector::Vector;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
@@ -228,4 +229,16 @@ pub async fn list_active(
         .await?;
 
     rows.into_iter().map(MemoryRecord::try_from).collect()
+}
+
+/// Attach an embedding vector to an existing memory record.
+/// Called after `store()` when an embedding provider is available.
+pub async fn store_embedding(pool: &PgPool, id: Uuid, embedding: Vec<f32>) -> Result<(), MogError> {
+    let vec = Vector::from(embedding);
+    sqlx::query("UPDATE memory_records SET embedding = $1 WHERE id = $2")
+        .bind(vec)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }

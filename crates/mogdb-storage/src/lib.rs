@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod conflict;
 pub mod db;
+pub mod embedding;
 pub mod entity;
 pub mod extraction;
 pub mod memory;
@@ -16,5 +17,6 @@ mod extraction_test;
 mod scoring_test;
 
 pub use db::Database;
-pub use pipeline::{ingest, IngestResult};
-pub use search::{SearchQuery, SearchResult};
+pub use embedding::{EmbeddingProvider, OllamaEmbeddings};
+pub use pipeline::{ingest, ingest_with_embedder, IngestResult};
+pub use search::{search_hybrid, SearchQuery, SearchResult};
