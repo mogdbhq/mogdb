@@ -18,8 +18,13 @@ use uuid::Uuid;
 const MIN_CLUSTER: usize = 5;
 const WINDOW_DAYS: i64 = 30;
 
-pub async fn run<L: LlmProvider>(pool: PgPool, llm: L, mut shutdown: watch::Receiver<bool>) {
-    let mut tick = interval(Duration::from_secs(60 * 60 * 24 * 7)); // every 7 days
+pub async fn run<L: LlmProvider>(
+    pool: PgPool,
+    llm: L,
+    mut shutdown: watch::Receiver<bool>,
+    period: Duration,
+) {
+    let mut tick = interval(period);
     tick.tick().await;
 
     loop {

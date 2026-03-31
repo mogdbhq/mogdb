@@ -6,8 +6,8 @@ use tokio::sync::watch;
 use tokio::time::{interval, Duration};
 use tracing::{error, info};
 
-pub async fn run(pool: PgPool, mut shutdown: watch::Receiver<bool>) {
-    let mut tick = interval(Duration::from_secs(60 * 60)); // every hour
+pub async fn run(pool: PgPool, mut shutdown: watch::Receiver<bool>, period: Duration) {
+    let mut tick = interval(period);
     tick.tick().await; // skip the immediate first tick
 
     loop {
