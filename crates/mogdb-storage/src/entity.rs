@@ -138,6 +138,63 @@ pub async fn invalidate_edges(
     Ok(affected)
 }
 
+/// List all entities for an agent+user (no limit — used by the graph explorer).
+pub async fn list_all(
+    pool: &PgPool,
+    agent_id: &str,
+    user_id: &str,
+) -> Result<Vec<Entity>, MogError> {
+    let rows = sqlx::query_as::<_, EntityRow>(
+        "SELECT id, agent_id, user_id, name, kind::TEXT AS kind, attributes, created_at, updated_at \
+         FROM entities WHERE agent_id = $1 AND user_id = $2 ORDER BY updated_at DESC",
+    )
+    .bind(agent_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(Entity::try_from).collect()
+}
+
+/// List all active entity edges for an agent (joins through entities table).
+pub async fn list_all_edges(
+    pool: &PgPool,
+    agent_id: &str,
+    user_id: &str,
+) -> Result<Vec<EntityEdge>, MogError> {
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, Uuid, String, f64, DateTime<Utc>, Option<DateTime<Utc>>, Option<Uuid>)>(
+        r#"
+        SELECT ee.id, ee.from_id, ee.to_id, ee.relation, ee.weight, ee.t_valid, ee.t_invalid, ee.source_memory
+        FROM entity_edges ee
+        JOIN entities e ON e.id = ee.from_id
+        WHERE e.agent_id = $1 AND e.user_id = $2
+          AND ee.t_invalid IS NULL
+        "#,
+    )
+    .bind(agent_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, from_id, to_id, relation, weight, t_valid, t_invalid, source_memory)| {
+                EntityEdge {
+                    id,
+                    from_id,
+                    to_id,
+                    relation,
+                    weight,
+                    t_valid,
+                    t_invalid,
+                    source_memory,
+                }
+            },
+        )
+        .collect())
+}
+
 /// Fetch an entity by ID.
 pub async fn fetch_by_id(pool: &PgPool, id: Uuid) -> Result<Entity, MogError> {
     let row = sqlx::query_as::<_, EntityRow>(

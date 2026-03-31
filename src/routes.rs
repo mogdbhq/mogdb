@@ -9,12 +9,17 @@ use axum::{
 };
 use metrics::counter;
 use mogdb_core::MemoryKind;
-use mogdb_storage::{memory, pipeline, search::SearchQuery, search_hybrid, OllamaEmbeddings};
+use mogdb_storage::{
+    entity, memory, pipeline, search::SearchQuery, search_hybrid, OllamaEmbeddings,
+};
 use uuid::Uuid;
 
 use crate::{
     middleware::require_api_key,
-    models::{parse_kind, parse_source_trust, ErrorBody, IngestBody, IngestResponse, SearchParams},
+    models::{
+        parse_kind, parse_source_trust, ErrorBody, GraphData, GraphEdge, GraphNode, IngestBody,
+        IngestResponse, SearchParams,
+    },
     AppState,
 };
 
@@ -36,7 +41,9 @@ pub fn build_router(state: AppState) -> Router {
     // Public routes — no auth required
     let public = Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(prometheus_metrics));
+        .route("/metrics", get(prometheus_metrics))
+        .route("/explorer", get(explorer))
+        .route("/api/graph", get(graph_data));
 
     Router::new()
         .merge(protected)
@@ -241,4 +248,109 @@ fn internal_error(msg: &str) -> axum::response::Response {
         }),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /explorer
+// ---------------------------------------------------------------------------
+
+async fn explorer() -> impl IntoResponse {
+    axum::response::Html(include_str!("explorer.html"))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/graph
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct GraphQuery {
+    agent_id: String,
+    user_id: String,
+}
+
+async fn graph_data(
+    State(state): State<AppState>,
+    Query(params): Query<GraphQuery>,
+) -> impl IntoResponse {
+    let (memories_res, entities_res, edges_res) = tokio::join!(
+        memory::list_active(&state.pool, &params.agent_id, &params.user_id, 300),
+        entity::list_all(&state.pool, &params.agent_id, &params.user_id),
+        entity::list_all_edges(&state.pool, &params.agent_id, &params.user_id),
+    );
+
+    let memories = match memories_res {
+        Ok(m) => m,
+        Err(e) => return internal_error(&e.to_string()),
+    };
+    let entities = match entities_res {
+        Ok(e) => e,
+        Err(e) => return internal_error(&e.to_string()),
+    };
+    let edges = match edges_res {
+        Ok(e) => e,
+        Err(e) => return internal_error(&e.to_string()),
+    };
+
+    // Build a name → entity_id map for resolving memory→entity edges
+    let name_to_id: std::collections::HashMap<String, String> = entities
+        .iter()
+        .map(|e| (e.name.to_lowercase(), e.id.to_string()))
+        .collect();
+
+    let mut nodes: Vec<GraphNode> = Vec::new();
+    let mut graph_edges: Vec<GraphEdge> = Vec::new();
+
+    // Memory nodes
+    for m in &memories {
+        let kind_str = format!("{:?}", m.kind).to_lowercase();
+        nodes.push(GraphNode {
+            id: m.id.to_string(),
+            label: m.content.chars().take(60).collect::<String>(),
+            node_type: "memory".to_string(),
+            kind: kind_str,
+            strength: m.strength,
+            importance: m.importance,
+            content: Some(m.content.clone()),
+        });
+
+        // Memory → entity edges via entity_refs
+        for ref_name in &m.entity_refs {
+            if let Some(entity_id) = name_to_id.get(&ref_name.to_lowercase()) {
+                graph_edges.push(GraphEdge {
+                    source: m.id.to_string(),
+                    target: entity_id.clone(),
+                    relation: "references".to_string(),
+                });
+            }
+        }
+    }
+
+    // Entity nodes
+    for e in &entities {
+        let kind_str = format!("{:?}", e.kind).to_lowercase();
+        nodes.push(GraphNode {
+            id: e.id.to_string(),
+            label: e.name.clone(),
+            node_type: "entity".to_string(),
+            kind: kind_str,
+            strength: 1.0,
+            importance: 0.5,
+            content: None,
+        });
+    }
+
+    // Entity → entity edges
+    for edge in &edges {
+        graph_edges.push(GraphEdge {
+            source: edge.from_id.to_string(),
+            target: edge.to_id.to_string(),
+            relation: edge.relation.clone(),
+        });
+    }
+
+    Json(GraphData {
+        nodes,
+        edges: graph_edges,
+    })
+    .into_response()
 }

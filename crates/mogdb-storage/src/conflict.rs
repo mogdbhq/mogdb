@@ -35,7 +35,8 @@ pub async fn find_conflicts(
 
     let tsquery = query_terms.join(" | ");
 
-    // Find active memories that share entities OR are textually related
+    // Find active memories that share entities OR are textually related.
+    // Exclude exact-same content — a duplicate is never a conflict.
     let candidates = if entity_refs.is_empty() {
         // No entities — use full-text search only
         sqlx::query_as::<_, (Uuid, String, DateTime<Utc>, f64, f32)>(
@@ -48,14 +49,16 @@ pub async fn find_conflicts(
               AND t_expired IS NULL
               AND t_invalid IS NULL
               AND quarantined = false
+              AND content != $4
               AND to_tsvector('english', content) @@ to_tsquery('english', $3)
             ORDER BY rank DESC
-            LIMIT 10
+            LIMIT 20
             "#,
         )
         .bind(agent_id)
         .bind(user_id)
         .bind(&tsquery)
+        .bind(content)
         .fetch_all(pool)
         .await?
     } else {
@@ -70,18 +73,20 @@ pub async fn find_conflicts(
               AND t_expired IS NULL
               AND t_invalid IS NULL
               AND quarantined = false
+              AND content != $5
               AND (
                   entity_refs && $4
                   OR to_tsvector('english', content) @@ to_tsquery('english', $3)
               )
             ORDER BY rank DESC
-            LIMIT 10
+            LIMIT 20
             "#,
         )
         .bind(agent_id)
         .bind(user_id)
         .bind(&tsquery)
         .bind(entity_refs)
+        .bind(content)
         .fetch_all(pool)
         .await?
     };

@@ -51,6 +51,39 @@ pub struct SearchParams {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/graph
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub label: String,
+    /// "memory" | "entity"
+    pub node_type: String,
+    /// e.g. "episodic" / "semantic" / "person" / "tool"
+    pub kind: String,
+    /// 0.0–1.0 decay strength (memories); 1.0 for entities
+    pub strength: f64,
+    /// 0.0–1.0 importance (memories); 0.5 for entities
+    pub importance: f64,
+    /// Full content — only populated for memories
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraphData {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+// ---------------------------------------------------------------------------
 // Error response
 // ---------------------------------------------------------------------------
 

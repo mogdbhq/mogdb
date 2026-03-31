@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MogDB Memory Explorer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    flex-shrink: 0;
+    z-index: 10;
+  }
+  #toolbar h1 { font-size: 15px; font-weight: 600; color: #f0f6fc; letter-spacing: .4px; }
+  #toolbar label { font-size: 12px; color: #8b949e; }
+  #toolbar input {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    padding: 4px 8px;
+    font-size: 12px;
+    width: 160px;
+  }
+  #toolbar input:focus { outline: none; border-color: #388bfd; }
+  #refresh-btn {
+    margin-left: auto;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  #refresh-btn:hover { background: #30363d; }
+  #status { font-size: 11px; color: #8b949e; min-width: 140px; text-align: right; }
+
+  #main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+  }
+
+  #graph-container {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+  }
+  canvas.grabbing { cursor: grabbing; }
+  canvas.pointer   { cursor: pointer; }
+
+  #legend {
+    position: absolute;
+    bottom: 12px;
+    left: 12px;
+    background: rgba(22,27,34,.92);
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 11px;
+    pointer-events: none;
+  }
+  #legend h3 { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
+  .legend-row { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+  #sidebar {
+    width: 300px;
+    background: #161b22;
+    border-left: 1px solid #30363d;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    flex-shrink: 0;
+    transition: width .2s;
+  }
+  #sidebar.hidden { width: 0; overflow: hidden; }
+
+  #sidebar-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid #30363d;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+  #sidebar-header h2 { font-size: 13px; color: #f0f6fc; }
+  #close-sidebar { background: none; border: none; color: #8b949e; font-size: 16px; cursor: pointer; }
+  #close-sidebar:hover { color: #c9d1d9; }
+
+  #sidebar-content { padding: 16px; flex: 1; }
+  .detail-row { margin-bottom: 12px; }
+  .detail-label { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 3px; }
+  .detail-value { font-size: 12px; color: #c9d1d9; word-break: break-word; }
+  .detail-value.content-text {
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 8px;
+    line-height: 1.5;
+    font-size: 11px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .4px;
+  }
+  .strength-bar-wrap { background: #21262d; border-radius: 4px; height: 6px; margin-top: 4px; }
+  .strength-bar { height: 6px; border-radius: 4px; }
+
+  #loading {
+    position: absolute;
+    inset: 0;
+    background: rgba(13,17,23,.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    color: #8b949e;
+    z-index: 5;
+  }
+  #loading.hidden { display: none; }
+  .spinner {
+    width: 20px; height: 20px;
+    border: 2px solid #30363d;
+    border-top-color: #388bfd;
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    margin-right: 10px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>MogDB Explorer</h1>
+  <label>agent_id</label>
+  <input id="agent-input" placeholder="my-agent" />
+  <label>user_id</label>
+  <input id="user-input" placeholder="user-1" />
+  <button id="refresh-btn">Refresh</button>
+  <span id="status">–</span>
+</div>
+
+<div id="main">
+  <div id="graph-container">
+    <canvas id="graph-canvas"></canvas>
+    <div id="legend">
+      <h3>Legend</h3>
+      <div class="legend-row"><div class="legend-dot" style="background:#388bfd"></div>episodic</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#3fb950"></div>semantic</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#a371f7"></div>procedural</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#e3b341"></div>working</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#f78166"></div>person</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#39c5cf"></div>tool / system</div>
+      <div class="legend-row"><div class="legend-dot" style="background:#8b949e"></div>concept / other</div>
+    </div>
+    <div id="loading">
+      <div class="spinner"></div>Loading graph…
+    </div>
+  </div>
+  <div id="sidebar" class="hidden">
+    <div id="sidebar-header">
+      <h2 id="sidebar-title">Node details</h2>
+      <button id="close-sidebar">&times;</button>
+    </div>
+    <div id="sidebar-content"></div>
+  </div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+// ── colours ─────────────────────────────────────────────────────────────────
+const COLOR = {
+  episodic:'#388bfd', semantic:'#3fb950', procedural:'#a371f7', working:'#e3b341',
+  person:'#f78166', tool:'#39c5cf', system:'#39c5cf',
+  project:'#d2a8ff', concept:'#8b949e', other:'#8b949e',
+};
+const nodeColor  = d => COLOR[d.kind] ?? '#8b949e';
+const nodeRadius = d => (d.node_type === 'entity' ? 9 : 6) + d.importance * 5;
+
+// hex → r,g,b
+function hexRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+// ── canvas setup ─────────────────────────────────────────────────────────────
+const canvas  = document.getElementById('graph-canvas');
+const ctx     = canvas.getContext('2d');
+let   dpr     = window.devicePixelRatio || 1;
+
+function resizeCanvas() {
+  dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  canvas.width  = w * dpr;
+  canvas.height = h * dpr;
+  ctx.scale(dpr, dpr);
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ── state ────────────────────────────────────────────────────────────────────
+let nodes = [], edges = [];
+let simulation = null;
+let nodePositions = new Map();
+let autoRefreshTimer = null;
+let selectedNode = null;
+
+// pan / zoom
+const transform = { x: 0, y: 0, k: 1 };
+// drag
+let dragging = null;
+let panning  = false;
+let lastMouse = null;
+let mouseDownPos = null;
+
+// ── DOM refs ─────────────────────────────────────────────────────────────────
+const agentInput     = document.getElementById('agent-input');
+const userInput      = document.getElementById('user-input');
+const refreshBtn     = document.getElementById('refresh-btn');
+const statusEl       = document.getElementById('status');
+const loading        = document.getElementById('loading');
+const sidebar        = document.getElementById('sidebar');
+const sidebarTitle   = document.getElementById('sidebar-title');
+const sidebarContent = document.getElementById('sidebar-content');
+const closeSidebar   = document.getElementById('close-sidebar');
+
+// ── URL params ───────────────────────────────────────────────────────────────
+(function() {
+  const p = new URLSearchParams(window.location.search);
+  if (p.get('agent_id')) agentInput.value = p.get('agent_id');
+  if (p.get('user_id'))  userInput.value  = p.get('user_id');
+})();
+
+// ── hit test ─────────────────────────────────────────────────────────────────
+function hitTest(mx, my) {
+  const gx = (mx - transform.x) / transform.k;
+  const gy = (my - transform.y) / transform.k;
+  for (const n of nodes) {
+    const dx = n.x - gx, dy = n.y - gy;
+    if (dx*dx + dy*dy <= nodeRadius(n) ** 2) return n;
+  }
+  return null;
+}
+
+// ── render loop ──────────────────────────────────────────────────────────────
+function draw() {
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(transform.x, transform.y);
+  ctx.scale(transform.k, transform.k);
+
+  // edges
+  ctx.lineWidth = 1;
+  for (const e of edges) {
+    if (!e.source.x) continue;
+    ctx.beginPath();
+    ctx.moveTo(e.source.x, e.source.y);
+    ctx.lineTo(e.target.x, e.target.y);
+    ctx.strokeStyle = 'rgba(48,54,61,0.7)';
+    ctx.stroke();
+  }
+
+  // nodes
+  for (const n of nodes) {
+    if (n.x === undefined) continue;
+    const r     = nodeRadius(n);
+    const color = nodeColor(n);
+    const [cr, cg, cb] = hexRgb(color);
+    const isSelected = n === selectedNode;
+
+    // glow
+    ctx.save();
+    ctx.shadowBlur  = isSelected ? 30 : n.strength * 22;
+    ctx.shadowColor = color;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${cr},${cg},${cb},${0.35 + n.strength * 0.55})`;
+    ctx.strokeStyle = isSelected
+      ? '#ffffff'
+      : `rgba(${cr},${cg},${cb},0.9)`;
+    ctx.lineWidth = isSelected ? 2 : 1.5;
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
+    // label
+    ctx.font      = `${Math.round(10 / transform.k < 10 ? 10 : 10 / transform.k < 16 ? 10 : 10)}px 'Segoe UI',sans-serif`;
+    ctx.font      = '10px "Segoe UI",sans-serif';
+    ctx.fillStyle = 'rgba(201,209,217,0.9)';
+    ctx.textAlign = 'center';
+    const label = n.label.length > 28 ? n.label.slice(0, 28) + '…' : n.label;
+    ctx.fillText(label, n.x, n.y + r + 13);
+  }
+
+  ctx.restore();
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// ── fetch & render ────────────────────────────────────────────────────────────
+async function loadGraph() {
+  const agent = agentInput.value.trim();
+  const user  = userInput.value.trim();
+  if (!agent || !user) { statusEl.textContent = 'enter agent_id & user_id'; return; }
+
+  loading.classList.remove('hidden');
+  statusEl.textContent = 'loading…';
+
+  try {
+    const res = await fetch(`/api/graph?agent_id=${encodeURIComponent(agent)}&user_id=${encodeURIComponent(user)}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    buildGraph(data);
+    statusEl.textContent = `${data.nodes.length} nodes · ${data.edges.length} edges`;
+  } catch (err) {
+    statusEl.textContent = `error: ${err.message}`;
+  } finally {
+    loading.classList.add('hidden');
+  }
+}
+
+function buildGraph(data) {
+  if (simulation) simulation.stop();
+
+  // restore saved positions
+  data.nodes.forEach(n => {
+    const p = nodePositions.get(n.id);
+    if (p) { n.x = p.x; n.y = p.y; }
+  });
+
+  nodes = data.nodes;
+  edges = data.edges;
+
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+
+  simulation = d3.forceSimulation(nodes)
+    .force('link',    d3.forceLink(edges).id(d => d.id).distance(80).strength(0.4))
+    .force('charge',  d3.forceManyBody().strength(-220))
+    .force('center',  d3.forceCenter(W / 2, H / 2))
+    .force('collide', d3.forceCollide(d => nodeRadius(d) + 6))
+    .on('tick', () => {
+      nodes.forEach(n => nodePositions.set(n.id, { x: n.x, y: n.y }));
+    });
+
+  const hasPos = nodes.some(n => nodePositions.has(n.id));
+  if (hasPos) simulation.alpha(0.15);
+}
+
+// ── interaction ───────────────────────────────────────────────────────────────
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.12 : 0.89;
+  const mx = e.offsetX, my = e.offsetY;
+  transform.x = mx - (mx - transform.x) * factor;
+  transform.y = my - (my - transform.y) * factor;
+  transform.k = Math.max(0.08, Math.min(5, transform.k * factor));
+}, { passive: false });
+
+canvas.addEventListener('mousedown', e => {
+  mouseDownPos = { x: e.offsetX, y: e.offsetY };
+  const hit = hitTest(e.offsetX, e.offsetY);
+  if (hit) {
+    dragging = hit;
+    if (simulation) simulation.alphaTarget(0.3).restart();
+  } else {
+    panning = true;
+  }
+  lastMouse = { x: e.offsetX, y: e.offsetY };
+  canvas.classList.add('grabbing');
+});
+
+canvas.addEventListener('mousemove', e => {
+  if (dragging) {
+    dragging.fx = (e.offsetX - transform.x) / transform.k;
+    dragging.fy = (e.offsetY - transform.y) / transform.k;
+  } else if (panning && lastMouse) {
+    transform.x += e.offsetX - lastMouse.x;
+    transform.y += e.offsetY - lastMouse.y;
+    lastMouse = { x: e.offsetX, y: e.offsetY };
+  } else {
+    // hover cursor
+    canvas.classList.toggle('pointer', !!hitTest(e.offsetX, e.offsetY));
+  }
+  if (lastMouse && !panning) lastMouse = { x: e.offsetX, y: e.offsetY };
+});
+
+canvas.addEventListener('mouseup', e => {
+  canvas.classList.remove('grabbing');
+  canvas.classList.remove('pointer');
+
+  // click = mousedown & up within 5px
+  if (mouseDownPos) {
+    const dx = e.offsetX - mouseDownPos.x;
+    const dy = e.offsetY - mouseDownPos.y;
+    if (Math.sqrt(dx*dx + dy*dy) < 5) {
+      const hit = hitTest(e.offsetX, e.offsetY);
+      if (hit) {
+        selectedNode = hit;
+        showSidebar(hit);
+      } else {
+        selectedNode = null;
+        sidebar.classList.add('hidden');
+      }
+    }
+  }
+
+  if (dragging) {
+    dragging.fx = null;
+    dragging.fy = null;
+    if (simulation) simulation.alphaTarget(0);
+  }
+  dragging = null;
+  panning  = false;
+  lastMouse = null;
+  mouseDownPos = null;
+});
+
+canvas.addEventListener('mouseleave', () => {
+  if (dragging) { dragging.fx = null; dragging.fy = null; }
+  dragging = null; panning = false; lastMouse = null;
+  canvas.classList.remove('grabbing', 'pointer');
+  if (simulation) simulation.alphaTarget(0);
+});
+
+// ── sidebar ──────────────────────────────────────────────────────────────────
+function showSidebar(d) {
+  sidebarTitle.textContent = d.node_type === 'memory' ? 'Memory' : 'Entity';
+  sidebar.classList.remove('hidden');
+
+  const color = nodeColor(d);
+  const kindBadge = `<span class="badge" style="background:${color}22;color:${color};border:1px solid ${color}44">${d.kind}</span>`;
+  const typeBadge = `<span class="badge" style="background:#21262d;color:#8b949e;border:1px solid #30363d">${d.node_type}</span>`;
+  const sp = Math.round(d.strength * 100);
+  const ip = Math.round(d.importance * 100);
+
+  let html = `
+    <div class="detail-row">
+      <div class="detail-label">Type &amp; Kind</div>
+      <div class="detail-value">${typeBadge} ${kindBadge}</div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">Strength</div>
+      <div class="detail-value">${sp}%
+        <div class="strength-bar-wrap"><div class="strength-bar" style="width:${sp}%;background:${color}"></div></div>
+      </div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">Importance</div>
+      <div class="detail-value">${ip}%
+        <div class="strength-bar-wrap"><div class="strength-bar" style="width:${ip}%;background:#8b949e"></div></div>
+      </div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">ID</div>
+      <div class="detail-value" style="font-size:10px;color:#8b949e;font-family:monospace">${d.id}</div>
+    </div>`;
+
+  if (d.content) {
+    html += `<div class="detail-row">
+      <div class="detail-label">Content</div>
+      <div class="detail-value content-text">${esc(d.content)}</div>
+    </div>`;
+  } else {
+    html += `<div class="detail-row">
+      <div class="detail-label">Name</div>
+      <div class="detail-value">${esc(d.label)}</div>
+    </div>`;
+  }
+
+  sidebarContent.innerHTML = html;
+}
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── auto-refresh ──────────────────────────────────────────────────────────────
+function scheduleRefresh() {
+  clearTimeout(autoRefreshTimer);
+  autoRefreshTimer = setTimeout(() => loadGraph().then(scheduleRefresh), 30000);
+}
+
+// ── events ────────────────────────────────────────────────────────────────────
+refreshBtn.addEventListener('click', () => { clearTimeout(autoRefreshTimer); loadGraph().then(scheduleRefresh); });
+closeSidebar.addEventListener('click', () => { sidebar.classList.add('hidden'); selectedNode = null; });
+agentInput.addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(autoRefreshTimer); loadGraph().then(scheduleRefresh); } });
+userInput.addEventListener('keydown',  e => { if (e.key === 'Enter') { clearTimeout(autoRefreshTimer); loadGraph().then(scheduleRefresh); } });
+
+if (agentInput.value && userInput.value) {
+  loadGraph().then(scheduleRefresh);
+} else {
+  loading.classList.add('hidden');
+}
+</script>
+</body>
+</html>
