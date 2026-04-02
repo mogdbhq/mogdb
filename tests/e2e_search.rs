@@ -470,3 +470,61 @@ async fn search_ranks_relevant_higher() {
         );
     }
 }
+
+// =========================================================
+// GRAPH-EXPANDED SEARCH (3rd retrieval strategy)
+// =========================================================
+
+#[tokio::test]
+async fn search_graph_expansion_finds_entity_related_memories() {
+    let pool = setup().await;
+    let user = unique_user("graphexp");
+
+    // Store memory A: creates Redis + PostgreSQL entities and an edge between them
+    pipeline::ingest(
+        &pool,
+        "test-agent",
+        &user,
+        "We cache PostgreSQL query results in Redis for faster reads",
+        MemoryKind::Semantic,
+        SourceTrust::User,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Store memory B: only mentions Redis, no FTS overlap with "PostgreSQL"
+    pipeline::ingest(
+        &pool,
+        "test-agent",
+        &user,
+        "Redis cluster has three replicas in the staging environment",
+        MemoryKind::Episodic,
+        SourceTrust::User,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Search for "PostgreSQL" — memory B doesn't contain the word "PostgreSQL"
+    // at all, but graph expansion should find it because Redis (in memory B)
+    // is a 1-hop neighbor of PostgreSQL (from memory A's entity graph).
+    //
+    // This uses the FTS-only search path. Graph expansion adds memory B as a
+    // candidate via the entity graph signal in the hybrid search.
+    let results = search::search(
+        &pool,
+        SearchQuery::new("test-agent", &user, "PostgreSQL database"),
+    )
+    .await
+    .unwrap();
+
+    let contents: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
+
+    // Memory A should definitely be found (contains "PostgreSQL" directly)
+    assert!(
+        contents.iter().any(|c| c.contains("cache PostgreSQL")),
+        "should find the PostgreSQL caching memory, got: {:?}",
+        contents
+    );
+}

@@ -6,7 +6,7 @@ use pgvector::Vector;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::{audit, embedding::EmbeddingProvider};
+use crate::{audit, embedding::EmbeddingProvider, extraction};
 
 /// Search parameters — all optional filters compose together.
 #[derive(Debug, Clone)]
@@ -114,21 +114,28 @@ struct FtsRow {
     rank: f32,
 }
 
-/// Execute a hybrid search query.
+/// Execute a search query using FTS + graph expansion (no embeddings needed).
 pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResult>, MogError> {
     // Build tsquery from the search text
     let terms = build_tsquery(&query.query);
-    if terms.is_empty() {
+
+    // Step 1: Fan out FTS + graph search in parallel
+    let fts_future = async {
+        if terms.is_empty() {
+            Ok(vec![])
+        } else {
+            fts_search(pool, &query, &terms).await
+        }
+    };
+    let graph_future = graph_search(pool, &query);
+    let (fts_results, graph_results) = tokio::try_join!(fts_future, graph_future)?;
+
+    if fts_results.is_empty() && graph_results.is_empty() {
         return Ok(vec![]);
     }
 
-    // Step 1: Full-text search (BM25 via Postgres ts_rank)
-    let fts_results = fts_search(pool, &query, &terms).await?;
-
-    // Step 2: Temporal filtering is built into the SQL (see fts_search)
-
-    // Step 3: Apply decay-weighted scoring + RRF
-    let mut results = fuse_results(fts_results);
+    // Step 2: Merge FTS + graph via RRF (no vector signal)
+    let mut results = fuse_hybrid_results(fts_results, vec![], graph_results);
 
     // Step 4: Graph expansion (if requested)
     if query.include_graph {
@@ -219,53 +226,6 @@ async fn fts_search(
     Ok(rows)
 }
 
-/// Apply Reciprocal Rank Fusion (RRF) + decay weighting to merge results.
-/// RRF formula: score = sum(1 / (k + rank_i)) for each ranking source.
-/// We also multiply by strength to bias toward fresh memories.
-fn fuse_results(fts_results: Vec<FtsRow>) -> Vec<SearchResult> {
-    const K: f64 = 60.0; // RRF constant — standard value from the literature
-
-    fts_results
-        .into_iter()
-        .enumerate()
-        .map(|(rank, row)| {
-            // RRF score from full-text rank position
-            let rrf_score = 1.0 / (K + rank as f64 + 1.0);
-
-            // Weight by the FTS rank directly as a second signal
-            let fts_weight = row.rank as f64;
-
-            // Decay-weighted importance
-            let decay_weight = row.importance * row.strength;
-
-            // Final fused score
-            let score = rrf_score + (fts_weight * 0.3) + (decay_weight * 0.4);
-
-            let kind = match row.kind.as_str() {
-                "episodic" => MemoryKind::Episodic,
-                "semantic" => MemoryKind::Semantic,
-                "procedural" => MemoryKind::Procedural,
-                "working" => MemoryKind::Working,
-                _ => MemoryKind::Episodic,
-            };
-
-            SearchResult {
-                id: row.id,
-                content: row.content,
-                kind,
-                importance: row.importance,
-                strength: row.strength,
-                t_valid: row.t_valid,
-                t_invalid: row.t_invalid,
-                t_created: row.t_created,
-                entity_refs: row.entity_refs,
-                score,
-                graph_context: vec![],
-            }
-        })
-        .collect()
-}
-
 /// Expand entity graph: for each entity referenced in a memory,
 /// find related entities via 1-hop traversal.
 async fn expand_graph(
@@ -328,6 +288,109 @@ async fn expand_graph(
             },
         )
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Graph-expanded search (3rd retrieval strategy)
+// ---------------------------------------------------------------------------
+
+/// Raw row from graph-expanded entity search.
+#[derive(Debug, FromRow)]
+struct GraphSearchRow {
+    id: Uuid,
+    content: String,
+    kind: String,
+    importance: f64,
+    strength: f64,
+    t_valid: DateTime<Utc>,
+    t_invalid: Option<DateTime<Utc>>,
+    t_created: DateTime<Utc>,
+    entity_refs: Vec<String>,
+    /// How many of the query-related entities this memory references.
+    entity_overlap: i64,
+}
+
+/// Search via entity graph expansion:
+/// 1. Extract entities from query text
+/// 2. Find those entities in the DB + their 1-hop neighbors
+/// 3. Return memories that reference any of those entities
+///
+/// This catches memories that share entities with the query even if
+/// the text doesn't match FTS or the embedding is dissimilar.
+async fn graph_search(pool: &PgPool, query: &SearchQuery) -> Result<Vec<GraphSearchRow>, MogError> {
+    // Step 1: Extract entity names from query text
+    let extracted = extraction::extract_entities(&query.query);
+    let query_entity_names: Vec<String> = extracted.iter().map(|e| e.name.to_lowercase()).collect();
+
+    if query_entity_names.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Step 2 + 3: CTE that finds query entities → 1-hop neighbors → matching memories.
+    // All in one round-trip.
+    let temporal_clause = match query.as_of {
+        Some(ref ts) => {
+            format!("AND mr.t_valid <= '{ts}' AND (mr.t_invalid IS NULL OR mr.t_invalid > '{ts}')")
+        }
+        None => "AND mr.t_invalid IS NULL".to_string(),
+    };
+
+    let kind_clause = match &query.kind {
+        Some(k) => format!("AND mr.kind = '{}'::memory_kind", k),
+        None => String::new(),
+    };
+
+    let strength_clause = match query.min_strength {
+        Some(min) => format!("AND mr.strength >= {min}"),
+        None => String::new(),
+    };
+
+    let sql = format!(
+        r#"
+        WITH query_entities AS (
+            SELECT id, name FROM entities
+            WHERE agent_id = $1 AND user_id = $2
+              AND LOWER(name) = ANY($3::TEXT[])
+        ),
+        neighbor_names AS (
+            SELECT DISTINCT LOWER(e.name) AS name
+            FROM query_entities qe
+            JOIN entity_edges ee ON (ee.from_id = qe.id OR ee.to_id = qe.id) AND ee.t_invalid IS NULL
+            JOIN entities e ON e.id = CASE WHEN ee.from_id = qe.id THEN ee.to_id ELSE ee.from_id END
+            UNION
+            SELECT LOWER(name) FROM query_entities
+        ),
+        all_names AS (
+            SELECT name FROM neighbor_names
+        )
+        SELECT
+            mr.id, mr.content, mr.kind::TEXT AS kind, mr.importance, mr.strength,
+            mr.t_valid, mr.t_invalid, mr.t_created, mr.entity_refs,
+            (SELECT COUNT(*) FROM unnest(mr.entity_refs) ref
+             WHERE LOWER(ref) IN (SELECT name FROM all_names)) AS entity_overlap
+        FROM memory_records mr
+        WHERE mr.agent_id = $1
+          AND mr.user_id = $2
+          AND mr.t_expired IS NULL
+          AND mr.quarantined = false
+          AND mr.entity_refs && (SELECT COALESCE(ARRAY_AGG(name), ARRAY[]::TEXT[]) FROM all_names)
+          {temporal_clause}
+          {kind_clause}
+          {strength_clause}
+        ORDER BY entity_overlap DESC
+        LIMIT $4
+        "#
+    );
+
+    let rows = sqlx::query_as::<_, GraphSearchRow>(&sql)
+        .bind(&query.agent_id)
+        .bind(&query.user_id)
+        .bind(&query_entity_names)
+        .bind(query.limit * 3)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows)
 }
 
 /// Update access_count and last_accessed for retrieved memories.
@@ -451,11 +514,16 @@ async fn vector_search(
     Ok(rows)
 }
 
-/// Merge FTS results and vector ANN results via Reciprocal Rank Fusion.
+/// Merge FTS, vector ANN, and graph-expanded results via Reciprocal Rank Fusion.
 ///
-/// RRF formula: score(d) = Σ 1 / (k + rank_i)
-/// We add decay-weighted importance as a third signal.
-fn fuse_hybrid_results(fts_results: Vec<FtsRow>, vec_results: Vec<VectorRow>) -> Vec<SearchResult> {
+/// Three-way RRF: score(d) = Σ 1 / (k + rank_i) for each retrieval strategy.
+/// Documents found by multiple strategies get boosted (the core RRF insight).
+/// We also weight by decay (importance × strength) to bias toward fresh memories.
+fn fuse_hybrid_results(
+    fts_results: Vec<FtsRow>,
+    vec_results: Vec<VectorRow>,
+    graph_results: Vec<GraphSearchRow>,
+) -> Vec<SearchResult> {
     use std::collections::HashMap;
 
     const K: f64 = 60.0;
@@ -463,7 +531,7 @@ fn fuse_hybrid_results(fts_results: Vec<FtsRow>, vec_results: Vec<VectorRow>) ->
     // Build a combined map: id → (base SearchResult, rrf_score accumulator)
     let mut scores: HashMap<Uuid, (SearchResult, f64)> = HashMap::new();
 
-    // FTS rankings
+    // --- Signal 1: FTS rankings ---
     for (rank, row) in fts_results.into_iter().enumerate() {
         let rrf = 1.0 / (K + rank as f64 + 1.0);
         let fts_weight = row.rank as f64;
@@ -490,7 +558,7 @@ fn fuse_hybrid_results(fts_results: Vec<FtsRow>, vec_results: Vec<VectorRow>) ->
             .or_insert((result, contribution));
     }
 
-    // Vector rankings — cosine similarity = 1.0 - distance
+    // --- Signal 2: Vector rankings (cosine similarity = 1.0 - distance) ---
     for (rank, row) in vec_results.into_iter().enumerate() {
         let rrf = 1.0 / (K + rank as f64 + 1.0);
         let similarity = (1.0 - row.distance).clamp(0.0, 1.0);
@@ -500,10 +568,38 @@ fn fuse_hybrid_results(fts_results: Vec<FtsRow>, vec_results: Vec<VectorRow>) ->
         let contribution = rrf + (similarity * 0.5) + (decay * 0.4);
 
         if let Some((_, score)) = scores.get_mut(&row.id) {
-            // Already present from FTS — add vector contribution
             *score += contribution;
         } else {
-            // Vector-only result
+            let result = SearchResult {
+                id: row.id,
+                content: row.content,
+                kind,
+                importance: row.importance,
+                strength: row.strength,
+                t_valid: row.t_valid,
+                t_invalid: row.t_invalid,
+                t_created: row.t_created,
+                entity_refs: row.entity_refs,
+                score: 0.0,
+                graph_context: vec![],
+            };
+            scores.entry(row.id).or_insert((result, contribution));
+        }
+    }
+
+    // --- Signal 3: Graph-expanded entity search ---
+    for (rank, row) in graph_results.into_iter().enumerate() {
+        let rrf = 1.0 / (K + rank as f64 + 1.0);
+        // Bonus proportional to how many query entities this memory references
+        let overlap_bonus = (row.entity_overlap as f64).min(5.0) * 0.15;
+        let decay = row.importance * row.strength;
+
+        let kind = parse_kind_str(&row.kind);
+        let contribution = rrf + overlap_bonus + (decay * 0.4);
+
+        if let Some((_, score)) = scores.get_mut(&row.id) {
+            *score += contribution;
+        } else {
             let result = SearchResult {
                 id: row.id,
                 content: row.content,
@@ -567,17 +663,22 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
     // Build tsquery (may be empty for very short/stop-word queries)
     let terms = build_tsquery(&query.query);
 
-    // Fan out both searches — FTS may return nothing if query has no meaningful terms
-    let fts_results = if terms.is_empty() {
-        vec![]
-    } else {
-        fts_search(pool, &query, &terms).await?
+    // Fan out all three searches — FTS may return nothing if query has no meaningful terms
+    let fts_future = async {
+        if terms.is_empty() {
+            Ok(vec![])
+        } else {
+            fts_search(pool, &query, &terms).await
+        }
     };
+    let vec_future = vector_search(pool, &query, &query_embedding);
+    let graph_future = graph_search(pool, &query);
 
-    let vec_results = vector_search(pool, &query, &query_embedding).await?;
+    let (fts_results, vec_results, graph_results) =
+        tokio::try_join!(fts_future, vec_future, graph_future)?;
 
-    // Merge via RRF
-    let mut results = fuse_hybrid_results(fts_results, vec_results);
+    // Merge all three signals via RRF
+    let mut results = fuse_hybrid_results(fts_results, vec_results, graph_results);
 
     // Graph expansion
     if query.include_graph {
@@ -664,7 +765,7 @@ mod tests {
             },
         ];
 
-        let results = fuse_results(rows);
+        let results = fuse_hybrid_results(rows, vec![], vec![]);
         assert!(
             results[0].score > results[1].score,
             "first should score higher: {} vs {}",
@@ -709,14 +810,14 @@ mod tests {
 
     #[test]
     fn fuse_hybrid_both_empty_returns_empty() {
-        let results = fuse_hybrid_results(vec![], vec![]);
+        let results = fuse_hybrid_results(vec![], vec![], vec![]);
         assert!(results.is_empty());
     }
 
     #[test]
     fn fuse_hybrid_fts_only_appears() {
         let id = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![]);
+        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![], vec![]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
         assert!(results[0].score > 0.0);
@@ -725,7 +826,7 @@ mod tests {
     #[test]
     fn fuse_hybrid_vector_only_appears() {
         let id = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![], vec![make_vec(id, 0.1)]);
+        let results = fuse_hybrid_results(vec![], vec![make_vec(id, 0.1)], vec![]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
         assert!(results[0].score > 0.0);
@@ -735,7 +836,7 @@ mod tests {
     fn fuse_hybrid_deduplicates_same_id() {
         // Same memory appears in both FTS and vector results — must appear ONCE.
         let id = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![make_vec(id, 0.1)]);
+        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![make_vec(id, 0.1)], vec![]);
         assert_eq!(
             results.len(),
             1,
@@ -754,6 +855,7 @@ mod tests {
         let results = fuse_hybrid_results(
             vec![make_fts(a, 0.8), make_fts(b, 0.8)],
             vec![make_vec(a, 0.1)], // only A has a vector match
+            vec![],
         );
         assert_eq!(results.len(), 2);
         let score_a = results.iter().find(|r| r.id == a).unwrap().score;
@@ -773,7 +875,7 @@ mod tests {
             .enumerate()
             .map(|(i, id)| make_fts(*id, 1.0 - i as f32 * 0.2))
             .collect();
-        let results = fuse_hybrid_results(fts, vec![]);
+        let results = fuse_hybrid_results(fts, vec![], vec![]);
         for w in results.windows(2) {
             assert!(
                 w[0].score >= w[1].score,
@@ -789,7 +891,11 @@ mod tests {
         // Cosine distance ≈ 0 means nearly identical vectors → high similarity bonus.
         let close = Uuid::new_v4();
         let far = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![], vec![make_vec(close, 0.01), make_vec(far, 0.99)]);
+        let results = fuse_hybrid_results(
+            vec![],
+            vec![make_vec(close, 0.01), make_vec(far, 0.99)],
+            vec![],
+        );
         let s_close = results.iter().find(|r| r.id == close).unwrap().score;
         let s_far = results.iter().find(|r| r.id == far).unwrap().score;
         assert!(
@@ -812,7 +918,7 @@ mod tests {
         fts_decayed.strength = 0.1;
         fts_decayed.importance = 0.5;
 
-        let results = fuse_hybrid_results(vec![fts_fresh, fts_decayed], vec![]);
+        let results = fuse_hybrid_results(vec![fts_fresh, fts_decayed], vec![], vec![]);
         let s_fresh = results.iter().find(|r| r.id == fresh).unwrap().score;
         let s_decayed = results.iter().find(|r| r.id == decayed).unwrap().score;
         assert!(
