@@ -114,12 +114,15 @@ struct FtsRow {
     rank: f32,
 }
 
-/// Execute a search query using FTS + graph expansion (no embeddings needed).
+/// Execute a search query using FTS + graph + temporal expansion (no embeddings needed).
 pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResult>, MogError> {
     // Build tsquery from the search text
     let terms = build_tsquery(&query.query);
 
-    // Step 1: Fan out FTS + graph search in parallel
+    // Extract temporal reference from query (if any)
+    let temporal_ref = extraction::extract_temporal(&query.query);
+
+    // Step 1: Fan out FTS + graph + temporal search in parallel
     let fts_future = async {
         if terms.is_empty() {
             Ok(vec![])
@@ -128,14 +131,21 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
         }
     };
     let graph_future = graph_search(pool, &query);
-    let (fts_results, graph_results) = tokio::try_join!(fts_future, graph_future)?;
+    let temporal_future = async {
+        match &temporal_ref {
+            Some(tr) => temporal_search(pool, &query, tr.center, tr.radius_secs).await,
+            None => Ok(vec![]),
+        }
+    };
+    let (fts_results, graph_results, temporal_results) =
+        tokio::try_join!(fts_future, graph_future, temporal_future)?;
 
-    if fts_results.is_empty() && graph_results.is_empty() {
+    if fts_results.is_empty() && graph_results.is_empty() && temporal_results.is_empty() {
         return Ok(vec![]);
     }
 
-    // Step 2: Merge FTS + graph via RRF (no vector signal)
-    let mut results = fuse_hybrid_results(fts_results, vec![], graph_results);
+    // Step 2: Merge FTS + graph + temporal via RRF (no vector signal)
+    let mut results = fuse_hybrid_results(fts_results, vec![], graph_results, temporal_results);
 
     // Step 4: Graph expansion (if requested)
     if query.include_graph {
@@ -415,6 +425,79 @@ async fn graph_search(pool: &PgPool, query: &SearchQuery) -> Result<Vec<GraphSea
     Ok(rows)
 }
 
+// ---------------------------------------------------------------------------
+// Temporal proximity search (4th retrieval strategy)
+// ---------------------------------------------------------------------------
+
+/// Raw row from temporal proximity search.
+#[derive(Debug, FromRow)]
+struct TemporalRow {
+    id: Uuid,
+    content: String,
+    kind: String,
+    importance: f64,
+    strength: f64,
+    t_valid: DateTime<Utc>,
+    t_invalid: Option<DateTime<Utc>>,
+    t_created: DateTime<Utc>,
+    entity_refs: Vec<String>,
+    /// Absolute distance in seconds from the target time.
+    distance_secs: f64,
+}
+
+/// Search for memories temporally close to a target time.
+///
+/// This is the 4th retrieval strategy: when a query contains temporal
+/// references ("last week", "in January", "3 days ago"), find memories
+/// whose t_valid is close to that time, ordered by proximity.
+async fn temporal_search(
+    pool: &PgPool,
+    query: &SearchQuery,
+    target: DateTime<Utc>,
+    radius_secs: i64,
+) -> Result<Vec<TemporalRow>, MogError> {
+    let kind_clause = match &query.kind {
+        Some(k) => format!("AND kind = '{}'::memory_kind", k),
+        None => String::new(),
+    };
+
+    let strength_clause = match query.min_strength {
+        Some(min) => format!("AND strength >= {min}"),
+        None => String::new(),
+    };
+
+    let sql = format!(
+        r#"
+        SELECT
+            id, content, kind::TEXT AS kind, importance, strength,
+            t_valid, t_invalid, t_created, entity_refs,
+            ABS(EXTRACT(EPOCH FROM (t_valid - $3))) AS distance_secs
+        FROM memory_records
+        WHERE agent_id = $1
+          AND user_id = $2
+          AND t_expired IS NULL
+          AND quarantined = false
+          AND t_invalid IS NULL
+          AND ABS(EXTRACT(EPOCH FROM (t_valid - $3))) <= $4
+          {kind_clause}
+          {strength_clause}
+        ORDER BY distance_secs ASC
+        LIMIT $5
+        "#
+    );
+
+    let rows = sqlx::query_as::<_, TemporalRow>(&sql)
+        .bind(&query.agent_id)
+        .bind(&query.user_id)
+        .bind(target)
+        .bind(radius_secs as f64)
+        .bind(query.limit * 3)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows)
+}
+
 /// Update access_count and last_accessed for retrieved memories.
 async fn touch_accessed(pool: &PgPool, ids: &[Uuid]) -> Result<(), MogError> {
     if ids.is_empty() {
@@ -536,15 +619,16 @@ async fn vector_search(
     Ok(rows)
 }
 
-/// Merge FTS, vector ANN, and graph-expanded results via Reciprocal Rank Fusion.
+/// Merge FTS, vector ANN, graph-expanded, and temporal results via Reciprocal Rank Fusion.
 ///
-/// Three-way RRF: score(d) = Σ 1 / (k + rank_i) for each retrieval strategy.
+/// Four-way RRF: score(d) = Σ 1 / (k + rank_i) for each retrieval strategy.
 /// Documents found by multiple strategies get boosted (the core RRF insight).
 /// We also weight by decay (importance × strength) to bias toward fresh memories.
 fn fuse_hybrid_results(
     fts_results: Vec<FtsRow>,
     vec_results: Vec<VectorRow>,
     graph_results: Vec<GraphSearchRow>,
+    temporal_results: Vec<TemporalRow>,
 ) -> Vec<SearchResult> {
     use std::collections::HashMap;
 
@@ -639,6 +723,44 @@ fn fuse_hybrid_results(
         }
     }
 
+    // --- Signal 4: Temporal proximity ---
+    // Memories closest to the target time get the highest scores.
+    // max_dist normalizes the distance into a 0-1 proximity score.
+    if !temporal_results.is_empty() {
+        let max_dist = temporal_results
+            .iter()
+            .map(|r| r.distance_secs)
+            .fold(1.0_f64, f64::max);
+
+        for (rank, row) in temporal_results.into_iter().enumerate() {
+            let rrf = 1.0 / (K + rank as f64 + 1.0);
+            let proximity = 1.0 - (row.distance_secs / max_dist).clamp(0.0, 1.0);
+            let decay = row.importance * row.strength;
+
+            let kind = parse_kind_str(&row.kind);
+            let contribution = rrf + (proximity * 0.5) + (decay * 0.4);
+
+            if let Some((_, score)) = scores.get_mut(&row.id) {
+                *score += contribution;
+            } else {
+                let result = SearchResult {
+                    id: row.id,
+                    content: row.content,
+                    kind,
+                    importance: row.importance,
+                    strength: row.strength,
+                    t_valid: row.t_valid,
+                    t_invalid: row.t_invalid,
+                    t_created: row.t_created,
+                    entity_refs: row.entity_refs,
+                    score: 0.0,
+                    graph_context: vec![],
+                };
+                scores.entry(row.id).or_insert((result, contribution));
+            }
+        }
+    }
+
     let mut results: Vec<SearchResult> = scores
         .into_values()
         .map(|(mut r, score)| {
@@ -685,7 +807,10 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
     // Build tsquery (may be empty for very short/stop-word queries)
     let terms = build_tsquery(&query.query);
 
-    // Fan out all three searches — FTS may return nothing if query has no meaningful terms
+    // Extract temporal reference from query (if any)
+    let temporal_ref = extraction::extract_temporal(&query.query);
+
+    // Fan out all four searches — FTS may return nothing if query has no meaningful terms
     let fts_future = async {
         if terms.is_empty() {
             Ok(vec![])
@@ -695,12 +820,19 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
     };
     let vec_future = vector_search(pool, &query, &query_embedding);
     let graph_future = graph_search(pool, &query);
+    let temporal_future = async {
+        match &temporal_ref {
+            Some(tr) => temporal_search(pool, &query, tr.center, tr.radius_secs).await,
+            None => Ok(vec![]),
+        }
+    };
 
-    let (fts_results, vec_results, graph_results) =
-        tokio::try_join!(fts_future, vec_future, graph_future)?;
+    let (fts_results, vec_results, graph_results, temporal_results) =
+        tokio::try_join!(fts_future, vec_future, graph_future, temporal_future)?;
 
-    // Merge all three signals via RRF
-    let mut results = fuse_hybrid_results(fts_results, vec_results, graph_results);
+    // Merge all four signals via RRF
+    let mut results =
+        fuse_hybrid_results(fts_results, vec_results, graph_results, temporal_results);
 
     // Graph expansion
     if query.include_graph {
@@ -793,7 +925,7 @@ mod tests {
             },
         ];
 
-        let results = fuse_hybrid_results(rows, vec![], vec![]);
+        let results = fuse_hybrid_results(rows, vec![], vec![], vec![]);
         assert!(
             results[0].score > results[1].score,
             "first should score higher: {} vs {}",
@@ -838,14 +970,14 @@ mod tests {
 
     #[test]
     fn fuse_hybrid_both_empty_returns_empty() {
-        let results = fuse_hybrid_results(vec![], vec![], vec![]);
+        let results = fuse_hybrid_results(vec![], vec![], vec![], vec![]);
         assert!(results.is_empty());
     }
 
     #[test]
     fn fuse_hybrid_fts_only_appears() {
         let id = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![], vec![]);
+        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![], vec![], vec![]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
         assert!(results[0].score > 0.0);
@@ -854,7 +986,7 @@ mod tests {
     #[test]
     fn fuse_hybrid_vector_only_appears() {
         let id = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![], vec![make_vec(id, 0.1)], vec![]);
+        let results = fuse_hybrid_results(vec![], vec![make_vec(id, 0.1)], vec![], vec![]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
         assert!(results[0].score > 0.0);
@@ -864,7 +996,12 @@ mod tests {
     fn fuse_hybrid_deduplicates_same_id() {
         // Same memory appears in both FTS and vector results — must appear ONCE.
         let id = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![make_vec(id, 0.1)], vec![]);
+        let results = fuse_hybrid_results(
+            vec![make_fts(id, 0.8)],
+            vec![make_vec(id, 0.1)],
+            vec![],
+            vec![],
+        );
         assert_eq!(
             results.len(),
             1,
@@ -883,6 +1020,7 @@ mod tests {
         let results = fuse_hybrid_results(
             vec![make_fts(a, 0.8), make_fts(b, 0.8)],
             vec![make_vec(a, 0.1)], // only A has a vector match
+            vec![],
             vec![],
         );
         assert_eq!(results.len(), 2);
@@ -903,7 +1041,7 @@ mod tests {
             .enumerate()
             .map(|(i, id)| make_fts(*id, 1.0 - i as f32 * 0.2))
             .collect();
-        let results = fuse_hybrid_results(fts, vec![], vec![]);
+        let results = fuse_hybrid_results(fts, vec![], vec![], vec![]);
         for w in results.windows(2) {
             assert!(
                 w[0].score >= w[1].score,
@@ -922,6 +1060,7 @@ mod tests {
         let results = fuse_hybrid_results(
             vec![],
             vec![make_vec(close, 0.01), make_vec(far, 0.99)],
+            vec![],
             vec![],
         );
         let s_close = results.iter().find(|r| r.id == close).unwrap().score;
@@ -946,7 +1085,7 @@ mod tests {
         fts_decayed.strength = 0.1;
         fts_decayed.importance = 0.5;
 
-        let results = fuse_hybrid_results(vec![fts_fresh, fts_decayed], vec![], vec![]);
+        let results = fuse_hybrid_results(vec![fts_fresh, fts_decayed], vec![], vec![], vec![]);
         let s_fresh = results.iter().find(|r| r.id == fresh).unwrap().score;
         let s_decayed = results.iter().find(|r| r.id == decayed).unwrap().score;
         assert!(

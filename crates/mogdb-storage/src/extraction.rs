@@ -271,6 +271,212 @@ fn is_known_tool_name(name: &str) -> bool {
     KNOWN_TOOLS.iter().any(|(k, _)| *k == lower)
 }
 
+// ---------------------------------------------------------------------------
+// Temporal expression extraction
+// ---------------------------------------------------------------------------
+
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
+
+/// A temporal reference extracted from text — either a point or a range.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemporalRef {
+    /// Center of the temporal reference (midpoint for ranges).
+    pub center: DateTime<Utc>,
+    /// Half-width of the window in seconds. A point has radius 0.
+    /// "last week" → center = 3.5 days ago, radius = 3.5 days.
+    pub radius_secs: i64,
+}
+
+/// Extract temporal references from a query string.
+///
+/// Recognizes patterns like:
+///   - "yesterday", "last week", "last month", "last year"
+///   - "N days/weeks/months ago"
+///   - "in January", "in March 2024"
+///   - "this week", "this month"
+///
+/// Returns None if no temporal reference is found.
+pub fn extract_temporal(text: &str) -> Option<TemporalRef> {
+    let lower = text.to_lowercase();
+    let now = Utc::now();
+
+    // "yesterday"
+    if lower.contains("yesterday") {
+        let center = now - Duration::hours(24);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 43200, // 12h
+        });
+    }
+
+    // "today"
+    if lower.contains("today") || lower.contains("this morning") || lower.contains("this evening") {
+        return Some(TemporalRef {
+            center: now,
+            radius_secs: 43200, // 12h
+        });
+    }
+
+    // "N days/weeks/months/years ago"
+    if let Some(temporal) = parse_n_units_ago(&lower, now) {
+        return Some(temporal);
+    }
+
+    // "last week" / "last month" / "last year"
+    if lower.contains("last week") {
+        let center = now - Duration::days(7);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 3 * 86400, // ±3 days
+        });
+    }
+    if lower.contains("last month") {
+        let center = now - Duration::days(30);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 15 * 86400, // ±15 days
+        });
+    }
+    if lower.contains("last year") {
+        let center = now - Duration::days(365);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 182 * 86400, // ±6 months
+        });
+    }
+
+    // "this week"
+    if lower.contains("this week") {
+        let center = now - Duration::days(3);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 3 * 86400,
+        });
+    }
+
+    // "this month"
+    if lower.contains("this month") {
+        let center = now - Duration::days(15);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 15 * 86400,
+        });
+    }
+
+    // "in January", "in February", ... optionally with year
+    if let Some(temporal) = parse_in_month(&lower, now) {
+        return Some(temporal);
+    }
+
+    None
+}
+
+/// Parse "N days/weeks/months/years ago" patterns.
+fn parse_n_units_ago(text: &str, now: DateTime<Utc>) -> Option<TemporalRef> {
+    // Match patterns like "3 days ago", "two weeks ago", "a month ago"
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| c.is_ascii_punctuation())
+                .to_string()
+        })
+        .collect();
+
+    for (i, word) in words.iter().enumerate() {
+        if word == "ago" && i >= 2 {
+            let unit = words[i - 1].as_str();
+            let n_str = words[i - 2].as_str();
+            let n: i64 = match n_str {
+                "a" | "an" | "one" => 1,
+                "two" => 2,
+                "three" => 3,
+                "four" => 4,
+                "five" => 5,
+                "six" => 6,
+                "seven" => 7,
+                "eight" => 8,
+                "nine" => 9,
+                "ten" => 10,
+                s => s.parse().ok()?,
+            };
+
+            let (days, radius) = match unit {
+                "day" | "days" => (n, 86400_i64 / 2),
+                "week" | "weeks" => (n * 7, 3 * 86400),
+                "month" | "months" => (n * 30, 15 * 86400),
+                "year" | "years" => (n * 365, 182 * 86400),
+                _ => return None,
+            };
+
+            let center = now - Duration::days(days);
+            return Some(TemporalRef {
+                center,
+                radius_secs: radius,
+            });
+        }
+    }
+    None
+}
+
+/// Parse "in January", "in March 2024" patterns.
+fn parse_in_month(text: &str, now: DateTime<Utc>) -> Option<TemporalRef> {
+    const MONTHS: &[(&str, u32)] = &[
+        ("january", 1),
+        ("february", 2),
+        ("march", 3),
+        ("april", 4),
+        ("may", 5),
+        ("june", 6),
+        ("july", 7),
+        ("august", 8),
+        ("september", 9),
+        ("october", 10),
+        ("november", 11),
+        ("december", 12),
+    ];
+
+    for (name, month_num) in MONTHS {
+        if let Some(pos) = text.find(name) {
+            // Check for "in <month>" pattern
+            let before = &text[..pos];
+            if !before.ends_with("in ")
+                && !before.ends_with("since ")
+                && !before.ends_with("during ")
+            {
+                continue;
+            }
+
+            // Check for year after month name
+            let after = &text[pos + name.len()..];
+            let year = after
+                .split_whitespace()
+                .next()
+                .and_then(|w| {
+                    w.trim_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<i32>()
+                        .ok()
+                })
+                .filter(|y| *y >= 2000 && *y <= 2100)
+                .unwrap_or_else(|| {
+                    // Default: if the month is in the future this year, use last year
+                    if *month_num > now.month() {
+                        now.year() - 1
+                    } else {
+                        now.year()
+                    }
+                });
+
+            let date = NaiveDate::from_ymd_opt(year, *month_num, 15)?;
+            let center = Utc.from_utc_datetime(&date.and_hms_opt(12, 0, 0)?);
+            return Some(TemporalRef {
+                center,
+                radius_secs: 15 * 86400, // ±15 days (covers the month)
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +531,55 @@ mod tests {
         let relation_types: Vec<&str> = rels.iter().map(|r| r.1.as_str()).collect();
         assert!(relation_types.contains(&"previously_used"));
         assert!(relation_types.contains(&"uses"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Temporal extraction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn temporal_yesterday() {
+        let t = extract_temporal("What did we discuss yesterday?").unwrap();
+        let age = Utc::now() - t.center;
+        assert!(age.num_hours() >= 12 && age.num_hours() <= 36);
+    }
+
+    #[test]
+    fn temporal_last_week() {
+        let t = extract_temporal("What happened last week?").unwrap();
+        let age = Utc::now() - t.center;
+        assert!(age.num_days() >= 5 && age.num_days() <= 10);
+    }
+
+    #[test]
+    fn temporal_n_days_ago() {
+        let t = extract_temporal("What did the user say 3 days ago?").unwrap();
+        let age = Utc::now() - t.center;
+        assert!(age.num_days() >= 2 && age.num_days() <= 4);
+    }
+
+    #[test]
+    fn temporal_two_months_ago() {
+        let t = extract_temporal("What were we working on two months ago?").unwrap();
+        let age = Utc::now() - t.center;
+        assert!(age.num_days() >= 50 && age.num_days() <= 70);
+    }
+
+    #[test]
+    fn temporal_in_month() {
+        let t = extract_temporal("What database was the user using in january?").unwrap();
+        assert_eq!(t.center.month(), 1);
+    }
+
+    #[test]
+    fn temporal_no_reference() {
+        assert!(extract_temporal("What is the user's favorite color?").is_none());
+    }
+
+    #[test]
+    fn temporal_this_week() {
+        let t = extract_temporal("What did we cover this week?").unwrap();
+        let age = Utc::now() - t.center;
+        assert!(age.num_days() <= 7);
     }
 }
