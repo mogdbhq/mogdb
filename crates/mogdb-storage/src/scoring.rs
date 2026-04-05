@@ -1,9 +1,17 @@
 /// Rule-based importance scoring for memory records.
 /// Phase 1: keyword heuristics. Later phases add LLM-based scoring.
 /// Score a piece of text for importance. Returns 0.0–1.0.
+///
+/// Preferences get a high importance boost (0.85) to ensure they survive
+/// decay and are reliably retrievable for preference questions.
 pub fn score_importance(content: &str, is_procedural: bool) -> f64 {
     if is_procedural {
         return 0.9;
+    }
+
+    // Preferences are high-value — they should survive decay
+    if crate::extraction::is_preference(content) {
+        return 0.85;
     }
 
     let lower = content.to_lowercase();

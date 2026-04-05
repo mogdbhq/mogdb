@@ -119,6 +119,9 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
     // Build tsquery from the search text
     let terms = build_tsquery(&query.query);
 
+    // Detect if this is a preference query (for post-fusion boosting)
+    let is_pref_query = extraction::is_preference_query(&query.query);
+
     // Extract temporal reference from query (if any)
     let temporal_ref = extraction::extract_temporal(&query.query);
 
@@ -146,6 +149,15 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
 
     // Step 2: Merge FTS + graph + temporal via RRF (no vector signal)
     let mut results = fuse_hybrid_results(fts_results, vec![], graph_results, temporal_results);
+
+    // Step 3: Preference boost — if query is about preferences, boost preference-bearing memories
+    if is_pref_query {
+        for result in &mut results {
+            if extraction::is_preference(&result.content) {
+                result.score *= 1.5;
+            }
+        }
+    }
 
     // Step 4: Graph expansion (if requested)
     if query.include_graph {
@@ -807,6 +819,9 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
     // Build tsquery (may be empty for very short/stop-word queries)
     let terms = build_tsquery(&query.query);
 
+    // Detect preference query for post-fusion boosting
+    let is_pref_query = extraction::is_preference_query(&query.query);
+
     // Extract temporal reference from query (if any)
     let temporal_ref = extraction::extract_temporal(&query.query);
 
@@ -833,6 +848,15 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
     // Merge all four signals via RRF
     let mut results =
         fuse_hybrid_results(fts_results, vec_results, graph_results, temporal_results);
+
+    // Preference boost
+    if is_pref_query {
+        for result in &mut results {
+            if extraction::is_preference(&result.content) {
+                result.score *= 1.5;
+            }
+        }
+    }
 
     // Graph expansion
     if query.include_graph {

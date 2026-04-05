@@ -532,6 +532,85 @@ Facts:"#
     facts
 }
 
+// ---------------------------------------------------------------------------
+// Preference / opinion detection
+// ---------------------------------------------------------------------------
+
+/// Detect whether text expresses a user preference or opinion.
+///
+/// Returns true if the text contains preference signals like "I prefer",
+/// "I like", "I hate", "my favorite", etc. Used to tag memories as
+/// preference-bearing for retrieval boosting.
+pub fn is_preference(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    const PREFERENCE_PATTERNS: &[&str] = &[
+        "i prefer",
+        "i like",
+        "i love",
+        "i hate",
+        "i dislike",
+        "i enjoy",
+        "i don't like",
+        "i want",
+        "i need",
+        "my favorite",
+        "my favourite",
+        "i always",
+        "i never",
+        "i usually",
+        "i tend to",
+        "rather than",
+        "instead of",
+        "better than",
+        "i'd rather",
+        "i would rather",
+        "can't stand",
+        "prefer to",
+        "big fan of",
+        "not a fan of",
+        "i'm into",
+        "i am into",
+        "allergic to",
+        "vegetarian",
+        "vegan",
+        "intolerant",
+        "don't eat",
+        "i avoid",
+    ];
+
+    PREFERENCE_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Detect whether a query is asking about preferences.
+pub fn is_preference_query(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    const QUERY_PATTERNS: &[&str] = &[
+        "what do i prefer",
+        "what do i like",
+        "what's my favorite",
+        "what is my favorite",
+        "what's my favourite",
+        "do i like",
+        "do i prefer",
+        "do i enjoy",
+        "what kind of",
+        "what type of",
+        "what sort of",
+        "recommend",
+        "suggestion",
+        "personalize",
+        "my preference",
+        "my taste",
+        "dietary",
+        "allergies",
+        "restrictions",
+    ];
+
+    QUERY_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 fn canonicalize(name: &str) -> String {
     match name {
         "aws" | "amazon web services" => "AWS".to_string(),
@@ -935,5 +1014,45 @@ That's all."#;
         let (ents, _) = parse_llm_extraction(json).unwrap();
         assert_eq!(ents.len(), 1);
         assert_eq!(ents[0].name, "Valid");
+    }
+
+    // -----------------------------------------------------------------------
+    // Preference detection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preference_detects_like() {
+        assert!(is_preference("I like spicy food"));
+        assert!(is_preference("I prefer dark mode"));
+        assert!(is_preference("I hate mornings"));
+        assert!(is_preference("My favorite color is blue"));
+    }
+
+    #[test]
+    fn preference_detects_dietary() {
+        assert!(is_preference("I'm vegetarian"));
+        assert!(is_preference("I'm allergic to peanuts"));
+        assert!(is_preference("I avoid dairy products"));
+    }
+
+    #[test]
+    fn preference_rejects_neutral() {
+        assert!(!is_preference("The meeting is at 3pm"));
+        assert!(!is_preference("PostgreSQL is a database"));
+    }
+
+    #[test]
+    fn preference_query_detected() {
+        assert!(is_preference_query("What do I like to eat?"));
+        assert!(is_preference_query(
+            "What's my favorite programming language?"
+        ));
+        assert!(is_preference_query("Do I have any dietary restrictions?"));
+    }
+
+    #[test]
+    fn preference_query_rejects_non_preference() {
+        assert!(!is_preference_query("What did we discuss yesterday?"));
+        assert!(!is_preference_query("When is the deadline?"));
     }
 }
