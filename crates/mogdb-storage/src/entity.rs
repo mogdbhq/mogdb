@@ -93,24 +93,30 @@ pub async fn upsert(
 }
 
 /// Create a directed relationship edge between two entities.
+///
+/// `valid_from` sets when this relationship became true in the real world.
+/// If None, defaults to NOW(). This lets edges inherit temporal context from
+/// the memory that created them (e.g. "user started using Postgres in January").
 pub async fn create_edge(
     pool: &PgPool,
     from_id: Uuid,
     to_id: Uuid,
     relation: &str,
     source_memory: Option<Uuid>,
+    valid_from: Option<DateTime<Utc>>,
 ) -> Result<Uuid, MogError> {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
         INSERT INTO entity_edges (id, from_id, to_id, relation, weight, t_valid, t_invalid, source_memory)
-        VALUES ($1, $2, $3, $4, 1.0, NOW(), NULL, $5)
+        VALUES ($1, $2, $3, $4, 1.0, COALESCE($5, NOW()), NULL, $6)
         "#,
     )
     .bind(id)
     .bind(from_id)
     .bind(to_id)
     .bind(relation)
+    .bind(valid_from)
     .bind(source_memory)
     .execute(pool)
     .await?;

@@ -8,6 +8,7 @@ pub mod extraction;
 pub mod forget;
 pub mod memory;
 pub mod pipeline;
+pub mod reranking;
 pub mod scoring;
 pub mod search;
 

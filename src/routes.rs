@@ -10,7 +10,7 @@ use axum::{
 use metrics::counter;
 use mogdb_core::MemoryKind;
 use mogdb_storage::{
-    entity, memory, pipeline, search::SearchQuery, search_hybrid, OllamaEmbeddings,
+    entity, memory, pipeline, reranking, search::SearchQuery, search_hybrid, OllamaEmbeddings,
 };
 use uuid::Uuid;
 
@@ -136,6 +136,7 @@ async fn search_memories(
 
     match search_hybrid(&state.pool, query, &embedder).await {
         Ok(results) => {
+            let results = reranking::rerank(&params.q, results).await;
             counter!("mogdb_api_searches_total").increment(1);
             Json(results).into_response()
         }

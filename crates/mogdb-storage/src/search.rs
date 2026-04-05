@@ -140,8 +140,14 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
     // Step 4: Graph expansion (if requested)
     if query.include_graph {
         for result in &mut results {
-            result.graph_context =
-                expand_graph(pool, &query.agent_id, &query.user_id, &result.entity_refs).await?;
+            result.graph_context = expand_graph(
+                pool,
+                &query.agent_id,
+                &query.user_id,
+                &result.entity_refs,
+                query.as_of,
+            )
+            .await?;
         }
     }
 
@@ -228,18 +234,29 @@ async fn fts_search(
 
 /// Expand entity graph: for each entity referenced in a memory,
 /// find related entities via 1-hop traversal.
+///
+/// When `as_of` is provided, only edges that were valid at that point in time
+/// are traversed (edge.t_valid <= as_of AND edge.t_invalid IS NULL or > as_of).
 async fn expand_graph(
     pool: &PgPool,
     agent_id: &str,
     user_id: &str,
     entity_refs: &[String],
+    as_of: Option<DateTime<Utc>>,
 ) -> Result<Vec<GraphNode>, MogError> {
     if entity_refs.is_empty() {
         return Ok(vec![]);
     }
 
-    // Find entities by name, then get their edges + connected entity names
-    let rows = sqlx::query_as::<_, (String, String, String, String)>(
+    // Temporal edge filter: point-in-time or currently-valid
+    let edge_temporal = match as_of {
+        Some(ref ts) => format!(
+            "AND edge.t_valid <= '{ts}' AND (edge.t_invalid IS NULL OR edge.t_invalid > '{ts}')"
+        ),
+        None => "AND edge.t_invalid IS NULL".to_string(),
+    };
+
+    let sql = format!(
         r#"
         SELECT
             e_from.name AS entity_name,
@@ -247,7 +264,7 @@ async fn expand_graph(
             edge.relation,
             e_to.name AS related_to
         FROM entities e_from
-        JOIN entity_edges edge ON edge.from_id = e_from.id AND edge.t_invalid IS NULL
+        JOIN entity_edges edge ON edge.from_id = e_from.id {edge_temporal}
         JOIN entities e_to ON e_to.id = edge.to_id
         WHERE e_from.agent_id = $1
           AND e_from.user_id = $2
@@ -261,7 +278,7 @@ async fn expand_graph(
             edge.relation,
             e_from.name AS related_to
         FROM entities e_to
-        JOIN entity_edges edge ON edge.to_id = e_to.id AND edge.t_invalid IS NULL
+        JOIN entity_edges edge ON edge.to_id = e_to.id {edge_temporal}
         JOIN entities e_from ON e_from.id = edge.from_id
         WHERE e_to.agent_id = $1
           AND e_to.user_id = $2
@@ -269,13 +286,15 @@ async fn expand_graph(
               SELECT LOWER(unnest) FROM unnest($3::TEXT[])
           )
         LIMIT 20
-        "#,
-    )
-    .bind(agent_id)
-    .bind(user_id)
-    .bind(entity_refs)
-    .fetch_all(pool)
-    .await?;
+        "#
+    );
+
+    let rows = sqlx::query_as::<_, (String, String, String, String)>(&sql)
+        .bind(agent_id)
+        .bind(user_id)
+        .bind(entity_refs)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .into_iter()
@@ -355,7 +374,9 @@ async fn graph_search(pool: &PgPool, query: &SearchQuery) -> Result<Vec<GraphSea
         neighbor_names AS (
             SELECT DISTINCT LOWER(e.name) AS name
             FROM query_entities qe
-            JOIN entity_edges ee ON (ee.from_id = qe.id OR ee.to_id = qe.id) AND ee.t_invalid IS NULL
+            JOIN entity_edges ee ON (ee.from_id = qe.id OR ee.to_id = qe.id)
+                AND ee.t_valid <= COALESCE($5, NOW())
+                AND (ee.t_invalid IS NULL OR ee.t_invalid > COALESCE($5, NOW()))
             JOIN entities e ON e.id = CASE WHEN ee.from_id = qe.id THEN ee.to_id ELSE ee.from_id END
             UNION
             SELECT LOWER(name) FROM query_entities
@@ -387,6 +408,7 @@ async fn graph_search(pool: &PgPool, query: &SearchQuery) -> Result<Vec<GraphSea
         .bind(&query.user_id)
         .bind(&query_entity_names)
         .bind(query.limit * 3)
+        .bind(query.as_of) // $5: temporal edge filter (NULL = use NOW())
         .fetch_all(pool)
         .await?;
 
@@ -683,8 +705,14 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
     // Graph expansion
     if query.include_graph {
         for result in &mut results {
-            result.graph_context =
-                expand_graph(pool, &query.agent_id, &query.user_id, &result.entity_refs).await?;
+            result.graph_context = expand_graph(
+                pool,
+                &query.agent_id,
+                &query.user_id,
+                &result.entity_refs,
+                query.as_of,
+            )
+            .await?;
         }
     }
 

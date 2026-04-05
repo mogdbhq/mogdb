@@ -141,7 +141,15 @@ pub async fn ingest(
                     entity::invalidate_edges(pool, subj_id, obj_id, "uses").await?;
                 }
 
-                entity::create_edge(pool, subj_id, obj_id, relation, Some(record.id)).await?;
+                entity::create_edge(
+                    pool,
+                    subj_id,
+                    obj_id,
+                    relation,
+                    Some(record.id),
+                    Some(record.t_valid),
+                )
+                .await?;
 
                 debug!(
                     subject = subj_name,
