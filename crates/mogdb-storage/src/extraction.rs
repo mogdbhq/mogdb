@@ -423,6 +423,115 @@ pub async fn extract_entities_with_llm(
     (entities, relations)
 }
 
+// ---------------------------------------------------------------------------
+// Atomic fact decomposition (via Ollama)
+// ---------------------------------------------------------------------------
+
+/// Whether fact decomposition is enabled (reads MOGDB_DECOMPOSE env var).
+pub fn decompose_enabled() -> bool {
+    std::env::var("MOGDB_DECOMPOSE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Decompose text into atomic facts using the LLM.
+///
+/// Takes a potentially long, multi-topic text and breaks it into
+/// short, single-fact statements. Each fact is self-contained and
+/// independently retrievable.
+///
+/// Returns the list of atomic fact strings, or the original text
+/// as a single-element vec on failure.
+pub async fn decompose_facts(text: &str) -> Vec<String> {
+    // Skip very short text — already atomic
+    if text.len() < 80 || text.split_whitespace().count() < 12 {
+        return vec![text.to_string()];
+    }
+
+    let extractor = OllamaExtractor::from_env();
+
+    let prompt = format!(
+        r#"Break this text into atomic facts. Each fact should be a single, self-contained statement.
+
+Text: {text}
+
+Rules:
+- Each fact should be one sentence, containing one piece of information
+- Preserve names, dates, numbers, and specific details exactly
+- Include who/what the fact is about (don't use pronouns without context)
+- If the text mentions preferences, state them explicitly ("User prefers X")
+- If the text mentions dates/times, include them in the fact
+- Output one fact per line, no numbering, no bullets
+- If the text is already a single fact, output it as-is
+
+Facts:"#
+    );
+
+    let resp = match extractor
+        .client
+        .post(format!("{}/api/chat", extractor.base_url))
+        .json(&serde_json::json!({
+            "model": extractor.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+            "options": {"temperature": 0, "num_predict": 1024}
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("fact decomposition request failed: {e}");
+            return vec![text.to_string()];
+        }
+    };
+
+    if !resp.status().is_success() {
+        warn!("fact decomposition API error: {}", resp.status());
+        return vec![text.to_string()];
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ChatResp {
+        message: ChatMsg,
+    }
+    #[derive(serde::Deserialize)]
+    struct ChatMsg {
+        content: String,
+    }
+
+    let body: ChatResp = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("fact decomposition parse error: {e}");
+            return vec![text.to_string()];
+        }
+    };
+
+    let facts: Vec<String> = body
+        .message
+        .content
+        .lines()
+        .map(|l| l.trim())
+        .map(|l| {
+            l.trim_start_matches(|c: char| c == '-' || c == '*' || c == '•' || c.is_ascii_digit())
+                .trim_start_matches('.')
+                .trim_start_matches(')')
+                .trim()
+                .to_string()
+        })
+        .filter(|l| l.len() >= 10 && l.len() <= 500)
+        .collect();
+
+    if facts.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    debug!("decomposed into {} atomic facts", facts.len());
+    facts
+}
+
 fn canonicalize(name: &str) -> String {
     match name {
         "aws" | "amazon web services" => "AWS".to_string(),
