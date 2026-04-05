@@ -242,3 +242,17 @@ pub async fn store_embedding(pool: &PgPool, id: Uuid, embedding: Vec<f32>) -> Re
         .await?;
     Ok(())
 }
+
+/// Update entity_refs on an existing memory record (e.g. after LLM extraction discovers new entities).
+pub async fn update_entity_refs(
+    pool: &PgPool,
+    id: Uuid,
+    entity_refs: &[String],
+) -> Result<(), MogError> {
+    sqlx::query("UPDATE memory_records SET entity_refs = $1 WHERE id = $2")
+        .bind(entity_refs)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

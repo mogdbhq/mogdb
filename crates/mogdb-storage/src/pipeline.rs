@@ -178,7 +178,10 @@ pub async fn ingest(
     })
 }
 
-/// Same as `ingest()` but also generates and stores an embedding vector.
+/// Same as `ingest()` but also:
+/// 1. Runs LLM-based entity extraction (catches entities keywords miss)
+/// 2. Generates and stores an embedding vector
+///
 /// The embedding is generated after the record is stored, so a storage failure
 /// never leaves an orphaned vector.
 #[allow(clippy::too_many_arguments)]
@@ -203,9 +206,102 @@ pub async fn ingest_with_embedder<E: EmbeddingProvider>(
     )
     .await?;
 
-    // Skip embedding for quarantined memories — they're unreviewed external content.
+    // Skip embedding + LLM extraction for quarantined memories.
     if !result.quarantined {
-        match embedder.embed(content).await {
+        // LLM entity extraction: find entities and relations that keywords missed.
+        // Runs in parallel with embedding generation.
+        let llm_future = extraction::extract_entities_with_llm(content);
+        let embed_future = embedder.embed(content);
+
+        let (llm_result, embed_result) = tokio::join!(llm_future, embed_future);
+
+        // Process LLM extraction results — add any new entities/edges
+        let (llm_entities, llm_relations) = llm_result;
+        let keyword_names: Vec<String> = result.entities_touched.to_vec();
+        let mut new_entities = Vec::new();
+
+        for ent in &llm_entities {
+            if !keyword_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&ent.name))
+            {
+                match entity::upsert(pool, agent_id, user_id, &ent.name, &ent.kind).await {
+                    Ok(_id) => {
+                        new_entities.push(ent.name.clone());
+                        debug!(name = %ent.name, "LLM extracted new entity");
+                    }
+                    Err(e) => warn!(name = %ent.name, error = %e, "failed to upsert LLM entity"),
+                }
+            }
+        }
+
+        // Add entity_refs for LLM-discovered entities to the memory record
+        if !new_entities.is_empty() {
+            let all_refs: Vec<String> = result
+                .memory
+                .entity_refs
+                .iter()
+                .cloned()
+                .chain(new_entities.iter().cloned())
+                .collect();
+            if let Err(e) = memory::update_entity_refs(pool, result.memory.id, &all_refs).await {
+                warn!(error = %e, "failed to update entity_refs with LLM entities");
+            }
+        }
+
+        // Process LLM relations
+        for (subject_hint, relation, object_hint) in &llm_relations {
+            let subj_name = if subject_hint == "_user"
+                || subject_hint.eq_ignore_ascii_case("user")
+                || subject_hint.eq_ignore_ascii_case("I")
+            {
+                user_id
+            } else {
+                subject_hint
+            };
+
+            // Find matching entity for the object
+            let obj_entity = llm_entities
+                .iter()
+                .find(|e| object_hint.to_lowercase().contains(&e.name.to_lowercase()));
+
+            if let Some(obj) = obj_entity {
+                let subj_id = match entity::upsert(
+                    pool,
+                    agent_id,
+                    user_id,
+                    subj_name,
+                    &mogdb_core::EntityKind::Person,
+                )
+                .await
+                {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let obj_id =
+                    match entity::upsert(pool, agent_id, user_id, &obj.name, &obj.kind).await {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+
+                if relation == "previously_used" || relation == "stopped_using" {
+                    let _ = entity::invalidate_edges(pool, subj_id, obj_id, "uses").await;
+                }
+
+                let _ = entity::create_edge(
+                    pool,
+                    subj_id,
+                    obj_id,
+                    relation,
+                    Some(result.memory.id),
+                    Some(result.memory.t_valid),
+                )
+                .await;
+            }
+        }
+
+        // Process embedding result
+        match embed_result {
             Ok(vec) => {
                 memory::store_embedding(pool, result.memory.id, vec).await?;
                 debug!(id = %result.memory.id, "stored embedding");

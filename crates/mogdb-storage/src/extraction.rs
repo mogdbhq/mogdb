@@ -1,6 +1,11 @@
-/// Rule-based entity extraction from text.
-/// Phase 1: pattern + keyword heuristics. Later phases add LLM extraction.
+/// Entity extraction from text — keyword heuristics + optional LLM extraction.
+///
+/// The keyword extractor catches known tools/systems reliably.
+/// The LLM extractor (via Ollama) catches implicit entities like "my manager",
+/// novel tools, and complex relationships that keywords miss.
+/// Results are merged: keywords first, then LLM additions that aren't duplicates.
 use mogdb_core::EntityKind;
+use tracing::{debug, warn};
 
 /// An extracted entity from text, before DB lookup/creation.
 #[derive(Debug, Clone, PartialEq)]
@@ -222,6 +227,200 @@ pub fn extract_relations(text: &str) -> Vec<(String, String, String)> {
     }
 
     relations
+}
+
+// ---------------------------------------------------------------------------
+// LLM-based entity extraction (via Ollama)
+// ---------------------------------------------------------------------------
+
+/// LLM extractor that uses Ollama's chat API.
+pub struct OllamaExtractor {
+    client: reqwest::Client,
+    base_url: String,
+    model: String,
+}
+
+impl OllamaExtractor {
+    pub fn from_env() -> Self {
+        let base_url =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let model = std::env::var("MOGDB_EXTRACT_MODEL")
+            .unwrap_or_else(|_| "dolphin-llama3:8b".to_string());
+        Self {
+            client: reqwest::Client::new(),
+            base_url,
+            model,
+        }
+    }
+
+    /// Extract entities from text using the LLM.
+    /// Returns extracted entities or an error (caller should fall back to keywords).
+    async fn extract(&self, text: &str) -> Result<ExtractionResult, String> {
+        let prompt = format!(
+            r#"Extract named entities and relationships from this text.
+
+Text: {text}
+
+Output ONLY valid JSON in this exact format:
+{{"entities":[{{"name":"EntityName","kind":"person|tool|system|concept|project|other"}}],"relations":[{{"subject":"SubjectName","relation":"uses|owns|works_on|manages|previously_used","object":"ObjectName"}}]}}
+
+Rules:
+- Include people (by name or role like "my manager", "my boss"), tools, systems, projects, concepts
+- For implicit references like "my manager", use the role as the name (e.g. "manager")
+- kind must be one of: person, tool, system, concept, project, other
+- Only include relations explicitly stated in the text
+- If no entities found, return {{"entities":[],"relations":[]}}
+
+JSON:"#
+        );
+
+        let resp = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&serde_json::json!({
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": false,
+                "options": {"temperature": 0, "num_predict": 512}
+            }))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| format!("ollama request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("ollama API {}", resp.status()));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ChatResp {
+            message: ChatMsg,
+        }
+        #[derive(serde::Deserialize)]
+        struct ChatMsg {
+            content: String,
+        }
+
+        let body: ChatResp = resp.json().await.map_err(|e| format!("parse error: {e}"))?;
+
+        parse_llm_extraction(&body.message.content)
+    }
+}
+
+/// Entities + relations extracted from text.
+type ExtractionResult = (Vec<ExtractedEntity>, Vec<(String, String, String)>);
+
+/// Parse the LLM's JSON output into entities and relations.
+fn parse_llm_extraction(text: &str) -> Result<ExtractionResult, String> {
+    // Find JSON in the response (model might add extra text)
+    let json_str = text
+        .find('{')
+        .and_then(|start| text.rfind('}').map(|end| &text[start..=end]))
+        .ok_or("no JSON found in response")?;
+
+    #[derive(serde::Deserialize)]
+    struct LlmOutput {
+        #[serde(default)]
+        entities: Vec<LlmEntity>,
+        #[serde(default)]
+        relations: Vec<LlmRelation>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LlmEntity {
+        name: String,
+        #[serde(default = "default_kind")]
+        kind: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct LlmRelation {
+        subject: String,
+        relation: String,
+        object: String,
+    }
+    fn default_kind() -> String {
+        "other".to_string()
+    }
+
+    let output: LlmOutput =
+        serde_json::from_str(json_str).map_err(|e| format!("JSON parse error: {e}"))?;
+
+    let entities: Vec<ExtractedEntity> = output
+        .entities
+        .into_iter()
+        .filter(|e| !e.name.is_empty() && e.name.len() <= 100)
+        .map(|e| ExtractedEntity {
+            name: e.name,
+            kind: match e.kind.as_str() {
+                "person" => EntityKind::Person,
+                "tool" => EntityKind::Tool,
+                "system" => EntityKind::System,
+                "concept" => EntityKind::Concept,
+                "project" => EntityKind::Project,
+                _ => EntityKind::Other,
+            },
+        })
+        .collect();
+
+    let relations: Vec<(String, String, String)> = output
+        .relations
+        .into_iter()
+        .filter(|r| !r.subject.is_empty() && !r.object.is_empty())
+        .map(|r| (r.subject, r.relation, r.object))
+        .collect();
+
+    Ok((entities, relations))
+}
+
+/// Extract entities using LLM, merged with keyword results.
+///
+/// Keyword extraction runs first (fast, reliable). Then the LLM adds any
+/// entities it finds that keywords missed. On LLM failure, returns keyword
+/// results only.
+pub async fn extract_entities_with_llm(
+    text: &str,
+) -> (Vec<ExtractedEntity>, Vec<(String, String, String)>) {
+    // Always start with keyword extraction (reliable baseline)
+    let mut entities = extract_entities(text);
+    let mut relations = extract_relations(text);
+
+    // Try LLM extraction
+    let extractor = OllamaExtractor::from_env();
+    match extractor.extract(text).await {
+        Ok((llm_entities, llm_relations)) => {
+            debug!(
+                "LLM extracted {} entities, {} relations",
+                llm_entities.len(),
+                llm_relations.len()
+            );
+
+            // Merge: add LLM entities that aren't already in keyword results
+            for llm_ent in llm_entities {
+                if !entities
+                    .iter()
+                    .any(|e| e.name.eq_ignore_ascii_case(&llm_ent.name))
+                {
+                    entities.push(llm_ent);
+                }
+            }
+
+            // Merge: add LLM relations that aren't duplicates
+            for llm_rel in llm_relations {
+                let is_dup = relations.iter().any(|(s, r, o)| {
+                    s.eq_ignore_ascii_case(&llm_rel.0)
+                        && r == &llm_rel.1
+                        && o.eq_ignore_ascii_case(&llm_rel.2)
+                });
+                if !is_dup {
+                    relations.push(llm_rel);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("LLM entity extraction failed, using keywords only: {e}");
+        }
+    }
+
+    (entities, relations)
 }
 
 fn canonicalize(name: &str) -> String {
@@ -581,5 +780,51 @@ mod tests {
         let t = extract_temporal("What did we cover this week?").unwrap();
         let age = Utc::now() - t.center;
         assert!(age.num_days() <= 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // LLM extraction JSON parser tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_llm_basic_json() {
+        let json = r#"{"entities":[{"name":"PostgreSQL","kind":"tool"},{"name":"Alice","kind":"person"}],"relations":[{"subject":"Alice","relation":"uses","object":"PostgreSQL"}]}"#;
+        let (ents, rels) = parse_llm_extraction(json).unwrap();
+        assert_eq!(ents.len(), 2);
+        assert_eq!(ents[0].name, "PostgreSQL");
+        assert_eq!(ents[0].kind, EntityKind::Tool);
+        assert_eq!(ents[1].name, "Alice");
+        assert_eq!(ents[1].kind, EntityKind::Person);
+        assert_eq!(rels.len(), 1);
+        assert_eq!(
+            rels[0],
+            ("Alice".into(), "uses".into(), "PostgreSQL".into())
+        );
+    }
+
+    #[test]
+    fn parse_llm_with_surrounding_text() {
+        let text = r#"Here are the extracted entities:
+{"entities":[{"name":"Redis","kind":"tool"}],"relations":[]}
+That's all."#;
+        let (ents, _) = parse_llm_extraction(text).unwrap();
+        assert_eq!(ents.len(), 1);
+        assert_eq!(ents[0].name, "Redis");
+    }
+
+    #[test]
+    fn parse_llm_empty_results() {
+        let json = r#"{"entities":[],"relations":[]}"#;
+        let (ents, rels) = parse_llm_extraction(json).unwrap();
+        assert!(ents.is_empty());
+        assert!(rels.is_empty());
+    }
+
+    #[test]
+    fn parse_llm_filters_empty_names() {
+        let json = r#"{"entities":[{"name":"","kind":"tool"},{"name":"Valid","kind":"other"}],"relations":[]}"#;
+        let (ents, _) = parse_llm_extraction(json).unwrap();
+        assert_eq!(ents.len(), 1);
+        assert_eq!(ents[0].name, "Valid");
     }
 }
