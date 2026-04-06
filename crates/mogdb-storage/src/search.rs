@@ -6,7 +6,7 @@ use pgvector::Vector;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::{audit, embedding::EmbeddingProvider, extraction};
+use crate::{audit, embedding::EmbeddingProvider, extraction, memory};
 
 /// Search parameters — all optional filters compose together.
 #[derive(Debug, Clone)]
@@ -88,6 +88,8 @@ pub struct SearchResult {
     pub score: f64,
     /// Related entity context pulled from the graph (if include_graph was true).
     pub graph_context: Vec<GraphNode>,
+    /// Previous versions of this memory (from supersedes chain).
+    pub version_history: Vec<VersionEntry>,
 }
 
 /// An entity node returned as graph context.
@@ -97,6 +99,13 @@ pub struct GraphNode {
     pub entity_kind: String,
     pub relation: String,
     pub related_to: String,
+}
+
+/// A previous version of a memory that was superseded.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VersionEntry {
+    pub content: String,
+    pub t_valid: DateTime<Utc>,
 }
 
 /// Raw row from full-text search.
@@ -173,7 +182,17 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
         }
     }
 
-    // Step 5: Sort by final score descending, apply limit
+    // Step 5: Attach version history (supersedes chains)
+    for result in &mut results {
+        if let Ok(chain) = memory::fetch_version_chain(pool, result.id).await {
+            result.version_history = chain
+                .into_iter()
+                .map(|(content, t_valid)| VersionEntry { content, t_valid })
+                .collect();
+        }
+    }
+
+    // Step 6: Sort by final score descending, apply limit
     results.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -181,7 +200,7 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
     });
     results.truncate(query.limit as usize);
 
-    // Step 6: Bump access_count for returned memories
+    // Step 7: Bump access_count for returned memories
     let ids: Vec<Uuid> = results.iter().map(|r| r.id).collect();
     touch_accessed(pool, &ids).await?;
 
@@ -668,6 +687,7 @@ fn fuse_hybrid_results(
             entity_refs: row.entity_refs,
             score: 0.0,
             graph_context: vec![],
+            version_history: vec![],
         };
         let contribution = rrf + (fts_weight * 0.3) + (decay * 0.4);
         scores
@@ -700,6 +720,7 @@ fn fuse_hybrid_results(
                 entity_refs: row.entity_refs,
                 score: 0.0,
                 graph_context: vec![],
+                version_history: vec![],
             };
             scores.entry(row.id).or_insert((result, contribution));
         }
@@ -730,6 +751,7 @@ fn fuse_hybrid_results(
                 entity_refs: row.entity_refs,
                 score: 0.0,
                 graph_context: vec![],
+                version_history: vec![],
             };
             scores.entry(row.id).or_insert((result, contribution));
         }
@@ -767,6 +789,7 @@ fn fuse_hybrid_results(
                     entity_refs: row.entity_refs,
                     score: 0.0,
                     graph_context: vec![],
+                    version_history: vec![],
                 };
                 scores.entry(row.id).or_insert((result, contribution));
             }
@@ -869,6 +892,16 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
                 query.as_of,
             )
             .await?;
+        }
+    }
+
+    // Attach version history (supersedes chains)
+    for result in &mut results {
+        if let Ok(chain) = memory::fetch_version_chain(pool, result.id).await {
+            result.version_history = chain
+                .into_iter()
+                .map(|(content, t_valid)| VersionEntry { content, t_valid })
+                .collect();
         }
     }
 

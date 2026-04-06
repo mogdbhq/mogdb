@@ -180,11 +180,27 @@ pub fn is_contradicting(existing: &str, incoming: &str, shared_entities: &[Strin
     false
 }
 
-/// Invalidate a list of conflicting memories.
+/// Invalidate a list of conflicting memories and create `supersedes` edges
+/// from the new memory to each invalidated one (version chain).
+///
+/// The `new_memory_id` is the incoming memory that caused the conflict.
+/// For each invalidated memory, a `supersedes` edge is created so the
+/// retrieval layer can follow the chain and present version history.
 pub async fn invalidate_conflicts(
     pool: &PgPool,
     agent_id: &str,
     conflict_ids: &[Uuid],
+) -> Result<u64, MogError> {
+    invalidate_conflicts_with_chain(pool, agent_id, conflict_ids, None).await
+}
+
+/// Same as `invalidate_conflicts` but also creates `supersedes` edges from
+/// `new_memory_id` to each invalidated memory.
+pub async fn invalidate_conflicts_with_chain(
+    pool: &PgPool,
+    agent_id: &str,
+    conflict_ids: &[Uuid],
+    new_memory_id: Option<Uuid>,
 ) -> Result<u64, MogError> {
     if conflict_ids.is_empty() {
         return Ok(0);
@@ -212,6 +228,23 @@ pub async fn invalidate_conflicts(
             )
             .await?;
             total += affected;
+
+            // Create supersedes edge: new_memory → old_memory
+            if let Some(new_id) = new_memory_id {
+                let edge_id = Uuid::new_v4();
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO entity_edges (id, from_id, to_id, relation, weight, t_valid, t_invalid, source_memory)
+                    VALUES ($1, $2, $3, 'supersedes', 1.0, NOW(), NULL, $4)
+                    "#,
+                )
+                .bind(edge_id)
+                .bind(new_id) // from: new memory
+                .bind(*id) // to: old memory
+                .bind(new_id) // source_memory
+                .execute(pool)
+                .await;
+            }
         }
     }
 

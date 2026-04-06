@@ -750,6 +750,26 @@ pub fn extract_temporal(text: &str) -> Option<TemporalRef> {
         });
     }
 
+    // "before/after <event>"
+    if let Some(temporal) = parse_before_after(&lower, now) {
+        return Some(temporal);
+    }
+
+    // "for N days/weeks/months" (duration)
+    if let Some(temporal) = parse_duration(&lower, now) {
+        return Some(temporal);
+    }
+
+    // Ordinals: "the first time", "the last time"
+    if let Some(temporal) = parse_ordinal(&lower, now) {
+        return Some(temporal);
+    }
+
+    // "since January", "since last week"
+    if let Some(temporal) = parse_since(&lower, now) {
+        return Some(temporal);
+    }
+
     // "in January", "in February", ... optionally with year
     if let Some(temporal) = parse_in_month(&lower, now) {
         return Some(temporal);
@@ -802,6 +822,206 @@ fn parse_n_units_ago(text: &str, now: DateTime<Utc>) -> Option<TemporalRef> {
             });
         }
     }
+    None
+}
+
+/// Parse "before/after <month>" patterns.
+/// e.g. "before January", "after March 2024"
+fn parse_before_after(text: &str, now: DateTime<Utc>) -> Option<TemporalRef> {
+    const MONTHS: &[(&str, u32)] = &[
+        ("january", 1),
+        ("february", 2),
+        ("march", 3),
+        ("april", 4),
+        ("may", 5),
+        ("june", 6),
+        ("july", 7),
+        ("august", 8),
+        ("september", 9),
+        ("october", 10),
+        ("november", 11),
+        ("december", 12),
+    ];
+
+    let is_before = text.contains("before ");
+    let is_after = text.contains("after ");
+    if !is_before && !is_after {
+        return None;
+    }
+
+    let prefix = if is_before { "before " } else { "after " };
+
+    for (name, month_num) in MONTHS {
+        if let Some(pos) = text.find(name) {
+            let before_text = &text[..pos];
+            if !before_text.ends_with(prefix) {
+                continue;
+            }
+
+            // Check for year after month
+            let after = &text[pos + name.len()..];
+            let year = after
+                .split_whitespace()
+                .next()
+                .and_then(|w| {
+                    w.trim_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<i32>()
+                        .ok()
+                })
+                .filter(|y| *y >= 2000 && *y <= 2100)
+                .unwrap_or_else(|| {
+                    if *month_num > now.month() {
+                        now.year() - 1
+                    } else {
+                        now.year()
+                    }
+                });
+
+            let date = NaiveDate::from_ymd_opt(year, *month_num, 15)?;
+            let month_center = Utc.from_utc_datetime(&date.and_hms_opt(12, 0, 0)?);
+
+            if is_before {
+                // "before January" → center is 45 days before month start, radius 45 days
+                let center = month_center - Duration::days(45);
+                return Some(TemporalRef {
+                    center,
+                    radius_secs: 45 * 86400,
+                });
+            } else {
+                // "after March" → center is 45 days after month end, radius 45 days
+                let center = month_center + Duration::days(45);
+                return Some(TemporalRef {
+                    center,
+                    radius_secs: 45 * 86400,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Parse duration patterns: "for N days/weeks/months"
+/// Treats as a window ending at now.
+fn parse_duration(text: &str, now: DateTime<Utc>) -> Option<TemporalRef> {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| c.is_ascii_punctuation())
+                .to_string()
+        })
+        .collect();
+
+    for (i, word) in words.iter().enumerate() {
+        if word == "for" && i + 2 < words.len() {
+            let n_str = words[i + 1].as_str();
+            let unit = words[i + 2].as_str();
+
+            let n: i64 = match n_str {
+                "a" | "an" | "one" => 1,
+                "two" => 2,
+                "three" => 3,
+                "four" => 4,
+                "five" => 5,
+                "six" => 6,
+                "seven" => 7,
+                "eight" => 8,
+                "nine" => 9,
+                "ten" => 10,
+                s => match s.parse().ok() {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+
+            let days = match unit {
+                "day" | "days" => n,
+                "week" | "weeks" => n * 7,
+                "month" | "months" => n * 30,
+                "year" | "years" => n * 365,
+                _ => continue,
+            };
+
+            let center = now - Duration::days(days / 2);
+            return Some(TemporalRef {
+                center,
+                radius_secs: (days * 86400) / 2,
+            });
+        }
+    }
+    None
+}
+
+/// Parse ordinal patterns: "the first time", "the last time", "the earliest", "the latest"
+fn parse_ordinal(text: &str, now: DateTime<Utc>) -> Option<TemporalRef> {
+    if text.contains("first time") || text.contains("earliest") {
+        // "the first time" → search far back with wide radius
+        let center = now - Duration::days(365 * 2);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 365 * 2 * 86400,
+        });
+    }
+
+    if text.contains("last time") || text.contains("most recent") || text.contains("latest") {
+        // "the last time" → search recent history
+        let center = now - Duration::days(30);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 365 * 86400,
+        });
+    }
+
+    None
+}
+
+/// Parse "since <reference>" patterns.
+/// e.g. "since January", "since last week", "since 2024"
+fn parse_since(text: &str, now: DateTime<Utc>) -> Option<TemporalRef> {
+    if !text.contains("since ") {
+        return None;
+    }
+
+    // "since last week"
+    if text.contains("since last week") {
+        let start = now - Duration::days(7);
+        let center = start + Duration::days(3);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 4 * 86400,
+        });
+    }
+
+    // "since last month"
+    if text.contains("since last month") {
+        let start = now - Duration::days(30);
+        let center = start + Duration::days(15);
+        return Some(TemporalRef {
+            center,
+            radius_secs: 15 * 86400,
+        });
+    }
+
+    // "since <year>"
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        if *word == "since" && i + 1 < words.len() {
+            if let Ok(year) = words[i + 1]
+                .trim_matches(|c: char| !c.is_ascii_digit())
+                .parse::<i32>()
+            {
+                if (2000..=2100).contains(&year) {
+                    let date = NaiveDate::from_ymd_opt(year, 7, 1)?;
+                    let center = Utc.from_utc_datetime(&date.and_hms_opt(12, 0, 0)?);
+                    let days_since = (now - center).num_days().abs();
+                    return Some(TemporalRef {
+                        center,
+                        radius_secs: days_since * 86400,
+                    });
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -1054,5 +1274,51 @@ That's all."#;
     fn preference_query_rejects_non_preference() {
         assert!(!is_preference_query("What did we discuss yesterday?"));
         assert!(!is_preference_query("When is the deadline?"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Extended temporal extraction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn temporal_before_month() {
+        let t = extract_temporal("What happened before january?").unwrap();
+        // Should target period before January
+        assert!(t.radius_secs > 30 * 86400);
+    }
+
+    #[test]
+    fn temporal_after_month() {
+        let t = extract_temporal("What changed after march?").unwrap();
+        assert!(t.radius_secs > 30 * 86400);
+    }
+
+    #[test]
+    fn temporal_for_duration() {
+        let t = extract_temporal("What have we worked on for three weeks?").unwrap();
+        let age = Utc::now() - t.center;
+        // Center should be about 10 days ago (half of 3 weeks)
+        assert!(age.num_days() >= 7 && age.num_days() <= 15);
+    }
+
+    #[test]
+    fn temporal_first_time() {
+        let t = extract_temporal("When was the first time the user mentioned Python?").unwrap();
+        // Should have a very wide radius to search far back
+        assert!(t.radius_secs > 300 * 86400);
+    }
+
+    #[test]
+    fn temporal_last_time() {
+        let t = extract_temporal("When was the last time we discussed the project?").unwrap();
+        // Should target recent history
+        assert!(t.radius_secs > 100 * 86400);
+    }
+
+    #[test]
+    fn temporal_since_last_week() {
+        let t = extract_temporal("What has changed since last week?").unwrap();
+        let age = Utc::now() - t.center;
+        assert!(age.num_days() >= 2 && age.num_days() <= 7);
     }
 }

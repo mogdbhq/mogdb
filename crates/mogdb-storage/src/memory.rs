@@ -243,6 +243,57 @@ pub async fn store_embedding(pool: &PgPool, id: Uuid, embedding: Vec<f32>) -> Re
     Ok(())
 }
 
+/// Fetch the version chain for a memory — previous versions it supersedes.
+/// Follows `supersedes` edges from `entity_edges` where from_id or to_id
+/// matches the memory ID. Returns (old_content, old_t_valid) pairs in
+/// chronological order (oldest first).
+pub async fn fetch_version_chain(
+    pool: &PgPool,
+    memory_id: Uuid,
+) -> Result<Vec<(String, DateTime<Utc>)>, MogError> {
+    let rows = sqlx::query_as::<_, (String, DateTime<Utc>)>(
+        r#"
+        SELECT mr.content, mr.t_valid
+        FROM entity_edges ee
+        JOIN memory_records mr ON mr.id = ee.to_id
+        WHERE ee.from_id = $1
+          AND ee.relation = 'supersedes'
+        ORDER BY mr.t_valid ASC
+        "#,
+    )
+    .bind(memory_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Find memories that were semantically similar at write time.
+/// Returns memory IDs linked via `semantically_related` edges.
+pub async fn fetch_semantic_links(
+    pool: &PgPool,
+    memory_id: Uuid,
+    limit: i32,
+) -> Result<Vec<Uuid>, MogError> {
+    let rows = sqlx::query_as::<_, (Uuid,)>(
+        r#"
+        SELECT CASE WHEN ee.from_id = $1 THEN ee.to_id ELSE ee.from_id END AS linked_id
+        FROM entity_edges ee
+        WHERE (ee.from_id = $1 OR ee.to_id = $1)
+          AND ee.relation = 'semantically_related'
+          AND ee.t_invalid IS NULL
+        ORDER BY ee.weight DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(memory_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 /// Update entity_refs on an existing memory record (e.g. after LLM extraction discovers new entities).
 pub async fn update_entity_refs(
     pool: &PgPool,

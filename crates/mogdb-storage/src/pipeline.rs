@@ -1,10 +1,14 @@
 /// The full write pipeline — orchestrates extraction, scoring, conflict
 /// detection, entity graph updates, and storage into a single `ingest()` call.
 use mogdb_core::{MemoryKind, MemoryRecord, MogError, NewMemoryRecord, SourceTrust};
+use pgvector::Vector;
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
 use crate::{conflict, embedding::EmbeddingProvider, entity, extraction, memory, scoring};
+
+/// Cosine similarity threshold for creating semantic links between memories.
+const SEMANTIC_LINK_THRESHOLD: f64 = 0.7;
 
 /// Result of ingesting a memory — includes what happened during the pipeline.
 #[derive(Debug)]
@@ -58,8 +62,11 @@ pub async fn ingest(
         warn!("memory from external source — will be quarantined");
     }
 
-    // Step 4: Detect and invalidate conflicts (skip for quarantined memories)
+    // Step 4: Detect conflicts (skip for quarantined memories)
+    // We defer invalidation until after the new memory is stored so we can
+    // create supersedes edges (version chains).
     let mut conflicts_invalidated = 0u64;
+    let mut detected_conflict_ids: Vec<uuid::Uuid> = Vec::new();
     if !quarantined {
         let candidates =
             conflict::find_conflicts(pool, agent_id, user_id, content, &entity_names).await?;
@@ -67,21 +74,18 @@ pub async fn ingest(
         if !candidates.is_empty() {
             debug!("found {} conflict candidates", candidates.len());
 
-            let conflict_ids: Vec<uuid::Uuid> = candidates
+            detected_conflict_ids = candidates
                 .iter()
                 .filter(|c| conflict::is_contradicting(&c.content, content, &entity_names))
                 .map(|c| {
                     info!(
                         id = %c.id,
                         old_content = c.content,
-                        "invalidating conflicting memory"
+                        "will invalidate conflicting memory"
                     );
                     c.id
                 })
                 .collect();
-
-            conflicts_invalidated =
-                conflict::invalidate_conflicts(pool, agent_id, &conflict_ids).await?;
         }
     }
 
@@ -100,6 +104,17 @@ pub async fn ingest(
     };
 
     let record = memory::store(pool, input).await?;
+
+    // Step 5b: Invalidate conflicts with version chain (supersedes edges)
+    if !detected_conflict_ids.is_empty() {
+        conflicts_invalidated = conflict::invalidate_conflicts_with_chain(
+            pool,
+            agent_id,
+            &detected_conflict_ids,
+            Some(record.id),
+        )
+        .await?;
+    }
 
     // Step 6: Update entity graph (skip for quarantined memories)
     let mut entities_touched = Vec::new();
@@ -167,7 +182,7 @@ pub async fn ingest(
         conflicts_invalidated,
         entities = entities_touched.len(),
         quarantined,
-        "memory ingested"
+        "memory ingested (basic)"
     );
 
     Ok(IngestResult {
@@ -305,19 +320,19 @@ async fn ingest_single_with_embedder<E: EmbeddingProvider>(
     let importance = scoring::score_importance(content, is_procedural);
     let quarantined = source_trust == SourceTrust::External;
 
-    // Conflict detection
+    // Conflict detection — with version chain creation (Task 6)
     let mut conflicts_invalidated = 0u64;
+    // We'll store conflict_ids so we can create supersedes edges after the record is stored
+    let mut detected_conflict_ids: Vec<uuid::Uuid> = Vec::new();
     if !quarantined {
         let candidates =
             conflict::find_conflicts(pool, agent_id, user_id, content, &entity_names).await?;
         if !candidates.is_empty() {
-            let conflict_ids: Vec<uuid::Uuid> = candidates
+            detected_conflict_ids = candidates
                 .iter()
                 .filter(|c| conflict::is_contradicting(&c.content, content, &entity_names))
                 .map(|c| c.id)
                 .collect();
-            conflicts_invalidated =
-                conflict::invalidate_conflicts(pool, agent_id, &conflict_ids).await?;
         }
     }
 
@@ -335,6 +350,17 @@ async fn ingest_single_with_embedder<E: EmbeddingProvider>(
     };
 
     let record = memory::store(pool, input).await?;
+
+    // Now invalidate conflicts with version chain (supersedes edges)
+    if !detected_conflict_ids.is_empty() {
+        conflicts_invalidated = conflict::invalidate_conflicts_with_chain(
+            pool,
+            agent_id,
+            &detected_conflict_ids,
+            Some(record.id),
+        )
+        .await?;
+    }
 
     // Entity graph
     let mut entities_touched = Vec::new();
@@ -449,10 +475,13 @@ async fn ingest_single_with_embedder<E: EmbeddingProvider>(
             }
         }
 
-        // Embedding
+        // Embedding + semantic links (Task 4)
         match embed_result {
             Ok(vec) => {
-                memory::store_embedding(pool, record.id, vec).await?;
+                memory::store_embedding(pool, record.id, vec.clone()).await?;
+
+                // Create semantic links to similar recent memories
+                let _ = create_semantic_links(pool, agent_id, user_id, record.id, &vec).await;
             }
             Err(e) => {
                 warn!(id = %record.id, error = %e, "embedding failed — stored without vector");
@@ -466,7 +495,7 @@ async fn ingest_single_with_embedder<E: EmbeddingProvider>(
         conflicts_invalidated,
         entities = entities_touched.len(),
         quarantined,
-        "memory ingested"
+        "memory ingested (with_embedder)"
     );
 
     Ok(IngestResult {
@@ -475,4 +504,82 @@ async fn ingest_single_with_embedder<E: EmbeddingProvider>(
         entities_touched,
         quarantined,
     })
+}
+
+/// Create semantic links between the new memory and existing similar memories.
+///
+/// Finds recent memories with cosine similarity > SEMANTIC_LINK_THRESHOLD and
+/// creates `semantically_related` edges with similarity as weight.
+/// This connects memories across sessions even when they share no entities.
+async fn create_semantic_links(
+    pool: &PgPool,
+    agent_id: &str,
+    user_id: &str,
+    memory_id: uuid::Uuid,
+    embedding: &[f32],
+) -> Result<u64, MogError> {
+    let vec = Vector::from(embedding.to_vec());
+
+    // Find similar memories (cosine distance < 1 - threshold)
+    let max_distance = 1.0 - SEMANTIC_LINK_THRESHOLD;
+    let similar = sqlx::query_as::<_, (uuid::Uuid, f64)>(
+        r#"
+        SELECT id, (embedding <=> $3) AS distance
+        FROM memory_records
+        WHERE agent_id = $1
+          AND user_id = $2
+          AND id != $4
+          AND t_expired IS NULL
+          AND quarantined = false
+          AND embedding IS NOT NULL
+          AND (embedding <=> $3) < $5
+        ORDER BY distance ASC
+        LIMIT 5
+        "#,
+    )
+    .bind(agent_id)
+    .bind(user_id)
+    .bind(&vec)
+    .bind(memory_id)
+    .bind(max_distance)
+    .fetch_all(pool)
+    .await?;
+
+    let mut links_created = 0u64;
+    for (similar_id, distance) in &similar {
+        let similarity = 1.0 - distance;
+        let edge_id = uuid::Uuid::new_v4();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO entity_edges (id, from_id, to_id, relation, weight, t_valid, t_invalid, source_memory)
+            VALUES ($1, $2, $3, 'semantically_related', $4, NOW(), NULL, $5)
+            "#,
+        )
+        .bind(edge_id)
+        .bind(memory_id)
+        .bind(similar_id)
+        .bind(similarity)
+        .bind(memory_id)
+        .execute(pool)
+        .await;
+
+        if result.is_ok() {
+            links_created += 1;
+            debug!(
+                from = %memory_id,
+                to = %similar_id,
+                similarity,
+                "created semantic link"
+            );
+        }
+    }
+
+    if links_created > 0 {
+        info!(
+            links_created,
+            "semantic links created for memory {memory_id}"
+        );
+    }
+
+    Ok(links_created)
 }
