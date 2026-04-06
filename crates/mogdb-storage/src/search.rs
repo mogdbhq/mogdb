@@ -134,7 +134,7 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
     // Extract temporal reference from query (if any)
     let temporal_ref = extraction::extract_temporal(&query.query);
 
-    // Step 1: Fan out FTS + graph + temporal search in parallel
+    // Step 1: Fan out FTS + graph + temporal + spreading activation in parallel
     let fts_future = async {
         if terms.is_empty() {
             Ok(vec![])
@@ -149,15 +149,26 @@ pub async fn search(pool: &PgPool, query: SearchQuery) -> Result<Vec<SearchResul
             None => Ok(vec![]),
         }
     };
-    let (fts_results, graph_results, temporal_results) =
-        tokio::try_join!(fts_future, graph_future, temporal_future)?;
+    let spreading_future = spreading_activation_search(pool, &query);
+    let (fts_results, graph_results, temporal_results, spreading_results) =
+        tokio::try_join!(fts_future, graph_future, temporal_future, spreading_future)?;
 
-    if fts_results.is_empty() && graph_results.is_empty() && temporal_results.is_empty() {
+    if fts_results.is_empty()
+        && graph_results.is_empty()
+        && temporal_results.is_empty()
+        && spreading_results.is_empty()
+    {
         return Ok(vec![]);
     }
 
-    // Step 2: Merge FTS + graph + temporal via RRF (no vector signal)
-    let mut results = fuse_hybrid_results(fts_results, vec![], graph_results, temporal_results);
+    // Step 2: Merge FTS + graph + temporal + spreading via RRF (no vector signal)
+    let mut results = fuse_hybrid_results(
+        fts_results,
+        vec![],
+        graph_results,
+        temporal_results,
+        spreading_results,
+    );
 
     // Step 3: Preference boost — if query is about preferences, boost preference-bearing memories
     if is_pref_query {
@@ -529,6 +540,295 @@ async fn temporal_search(
     Ok(rows)
 }
 
+// ---------------------------------------------------------------------------
+// Spreading activation search (5th retrieval strategy)
+// ---------------------------------------------------------------------------
+
+/// Edge-type multipliers (Hindsight-style μ(l)).
+/// Strong semantic edges get boosted, weak associations get dampened.
+fn edge_type_multiplier(relation: &str) -> f64 {
+    match relation {
+        "uses" | "owns" | "works_on" | "manages" => 1.2,
+        "supersedes" | "previously_used" | "stopped_using" => 1.1,
+        "semantically_related" => 0.8,
+        _ => 1.0,
+    }
+}
+
+/// Raw row from spreading activation search.
+#[derive(Debug)]
+struct SpreadingRow {
+    id: Uuid,
+    content: String,
+    kind: String,
+    importance: f64,
+    strength: f64,
+    t_valid: DateTime<Utc>,
+    t_invalid: Option<DateTime<Utc>>,
+    t_created: DateTime<Utc>,
+    entity_refs: Vec<String>,
+    /// The activation level this memory received (0.0 - 1.0).
+    activation: f64,
+}
+
+/// Spreading activation search: multi-hop graph traversal with Hindsight-style
+/// max-aggregation, edge-type multipliers, and firing thresholds.
+///
+/// Seeds query entities at 1.0, spreads through edges for up to 3 hops with
+/// decay 0.7 per hop. Uses MAX aggregation (not sum) to prevent hub explosion.
+/// Edge-type multipliers boost strong relations and dampen weak ones.
+/// Only entities above firing threshold 0.5 propagate further.
+async fn spreading_activation_search(
+    pool: &PgPool,
+    query: &SearchQuery,
+) -> Result<Vec<SpreadingRow>, MogError> {
+    use std::collections::HashMap;
+
+    const MAX_HOPS: usize = 3;
+    const DECAY: f64 = 0.7;
+    const FIRING_THRESHOLD: f64 = 0.5;
+
+    // Step 1: Extract seed entities from query
+    let extracted = extraction::extract_entities(&query.query);
+    let seed_names: Vec<String> = extracted.iter().map(|e| e.name.to_lowercase()).collect();
+
+    if seed_names.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Step 2: Load seed entity IDs from DB
+    let seed_rows = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id, LOWER(name) AS name FROM entities WHERE agent_id = $1 AND user_id = $2 AND LOWER(name) = ANY($3::TEXT[])",
+    )
+    .bind(&query.agent_id)
+    .bind(&query.user_id)
+    .bind(&seed_names)
+    .fetch_all(pool)
+    .await?;
+
+    if seed_rows.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // activation map: entity_id → (name, activation_level)
+    let mut activation: HashMap<Uuid, (String, f64)> = HashMap::new();
+    for (id, name) in &seed_rows {
+        activation.insert(*id, (name.clone(), 1.0));
+    }
+
+    // Step 3: Load all active edges for this agent+user (one round-trip)
+    let edge_temporal = match query.as_of {
+        Some(ref ts) => {
+            format!("AND ee.t_valid <= '{ts}' AND (ee.t_invalid IS NULL OR ee.t_invalid > '{ts}')")
+        }
+        None => "AND ee.t_invalid IS NULL".to_string(),
+    };
+
+    let sql = format!(
+        r#"
+        SELECT ee.from_id, ee.to_id, ee.relation, ee.weight,
+               LOWER(e_to.name) AS to_name, LOWER(e_from.name) AS from_name
+        FROM entity_edges ee
+        JOIN entities e_from ON e_from.id = ee.from_id
+        JOIN entities e_to ON e_to.id = ee.to_id
+        WHERE e_from.agent_id = $1 AND e_from.user_id = $2
+          {edge_temporal}
+        "#
+    );
+
+    let edges = sqlx::query_as::<_, (Uuid, Uuid, String, f64, String, String)>(&sql)
+        .bind(&query.agent_id)
+        .bind(&query.user_id)
+        .fetch_all(pool)
+        .await?;
+
+    if edges.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Step 4: Spread activation (MAX aggregation, Hindsight-style)
+    for _hop in 0..MAX_HOPS {
+        // Collect entities to fire this round (above threshold)
+        let firing: Vec<(Uuid, f64)> = activation
+            .iter()
+            .filter(|(_, (_, a))| *a >= FIRING_THRESHOLD)
+            .map(|(id, (_, a))| (*id, *a))
+            .collect();
+
+        if firing.is_empty() {
+            break;
+        }
+
+        let mut new_activations: HashMap<Uuid, (String, f64)> = HashMap::new();
+
+        for (source_id, source_activation) in &firing {
+            // Find edges from this entity (both directions)
+            for (from_id, to_id, relation, weight, to_name, from_name) in &edges {
+                let (neighbor_id, neighbor_name) = if from_id == source_id {
+                    (*to_id, to_name.clone())
+                } else if to_id == source_id {
+                    (*from_id, from_name.clone())
+                } else {
+                    continue;
+                };
+
+                let mu = edge_type_multiplier(relation);
+                let propagated = source_activation * weight * DECAY * mu;
+                let propagated = propagated.min(1.0); // cap at 1.0
+
+                // MAX aggregation: only update if this path gives higher activation
+                let current = new_activations
+                    .get(&neighbor_id)
+                    .map(|(_, a)| *a)
+                    .unwrap_or(0.0);
+
+                if propagated > current {
+                    new_activations.insert(neighbor_id, (neighbor_name, propagated));
+                }
+            }
+        }
+
+        // Merge new activations into main map (MAX with existing)
+        for (id, (name, new_a)) in new_activations {
+            let current = activation.get(&id).map(|(_, a)| *a).unwrap_or(0.0);
+            if new_a > current {
+                activation.insert(id, (name, new_a));
+            }
+        }
+    }
+
+    // Step 5: Collect all activated entity names (excluding seeds — graph_search handles those)
+    let activated_names: Vec<String> = activation
+        .values()
+        .filter(|(name, a)| *a > 0.0 && !seed_names.contains(name))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if activated_names.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Build activation lookup by name for scoring
+    let name_activation: HashMap<String, f64> = activation
+        .values()
+        .map(|(name, a)| (name.clone(), *a))
+        .collect();
+
+    // Step 6: Fetch memories referencing any activated entity
+    let temporal_clause = match query.as_of {
+        Some(ref ts) => {
+            format!("AND t_valid <= '{ts}' AND (t_invalid IS NULL OR t_invalid > '{ts}')")
+        }
+        None => "AND t_invalid IS NULL".to_string(),
+    };
+
+    let kind_clause = match &query.kind {
+        Some(k) => format!("AND kind = '{}'::memory_kind", k),
+        None => String::new(),
+    };
+
+    let strength_clause = match query.min_strength {
+        Some(min) => format!("AND strength >= {min}"),
+        None => String::new(),
+    };
+
+    // Combine seed + activated names for the query
+    let all_activated: Vec<String> = activation
+        .values()
+        .filter(|(_, a)| *a > 0.0)
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    let sql = format!(
+        r#"
+        SELECT id, content, kind::TEXT AS kind, importance, strength,
+               t_valid, t_invalid, t_created, entity_refs
+        FROM memory_records
+        WHERE agent_id = $1
+          AND user_id = $2
+          AND t_expired IS NULL
+          AND quarantined = false
+          AND entity_refs && $3::TEXT[]
+          {temporal_clause}
+          {kind_clause}
+          {strength_clause}
+        LIMIT $4
+        "#
+    );
+
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            f64,
+            f64,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+            Vec<String>,
+        ),
+    >(&sql)
+    .bind(&query.agent_id)
+    .bind(&query.user_id)
+    .bind(&all_activated)
+    .bind(query.limit * 3)
+    .fetch_all(pool)
+    .await?;
+
+    // Step 7: Score each memory by its max entity activation
+    let mut results: Vec<SpreadingRow> = rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                content,
+                kind,
+                importance,
+                strength,
+                t_valid,
+                t_invalid,
+                t_created,
+                entity_refs,
+            )| {
+                // Max activation across all entities this memory references
+                let max_activation = entity_refs
+                    .iter()
+                    .map(|e| {
+                        name_activation
+                            .get(&e.to_lowercase())
+                            .copied()
+                            .unwrap_or(0.0)
+                    })
+                    .fold(0.0_f64, f64::max);
+
+                SpreadingRow {
+                    id,
+                    content,
+                    kind,
+                    importance,
+                    strength,
+                    t_valid,
+                    t_invalid,
+                    t_created,
+                    entity_refs,
+                    activation: max_activation,
+                }
+            },
+        )
+        .collect();
+
+    // Sort by activation descending
+    results.sort_by(|a, b| {
+        b.activation
+            .partial_cmp(&a.activation)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(results)
+}
+
 /// Update access_count and last_accessed for retrieved memories.
 async fn touch_accessed(pool: &PgPool, ids: &[Uuid]) -> Result<(), MogError> {
     if ids.is_empty() {
@@ -650,9 +950,10 @@ async fn vector_search(
     Ok(rows)
 }
 
-/// Merge FTS, vector ANN, graph-expanded, and temporal results via Reciprocal Rank Fusion.
+/// Merge FTS, vector ANN, graph-expanded, temporal, and spreading activation results
+/// via Reciprocal Rank Fusion.
 ///
-/// Four-way RRF: score(d) = Σ 1 / (k + rank_i) for each retrieval strategy.
+/// Five-way RRF: score(d) = Σ 1 / (k + rank_i) for each retrieval strategy.
 /// Documents found by multiple strategies get boosted (the core RRF insight).
 /// We also weight by decay (importance × strength) to bias toward fresh memories.
 fn fuse_hybrid_results(
@@ -660,6 +961,7 @@ fn fuse_hybrid_results(
     vec_results: Vec<VectorRow>,
     graph_results: Vec<GraphSearchRow>,
     temporal_results: Vec<TemporalRow>,
+    spreading_results: Vec<SpreadingRow>,
 ) -> Vec<SearchResult> {
     use std::collections::HashMap;
 
@@ -796,6 +1098,36 @@ fn fuse_hybrid_results(
         }
     }
 
+    // --- Signal 5: Spreading activation ---
+    // Memories reached by multi-hop graph traversal, weighted by activation level.
+    for (rank, row) in spreading_results.into_iter().enumerate() {
+        let rrf = 1.0 / (K + rank as f64 + 1.0);
+        let decay = row.importance * row.strength;
+        // activation is already 0-1 from the spreading algorithm
+        let contribution = rrf + (row.activation * 0.6) + (decay * 0.3);
+
+        if let Some((_, score)) = scores.get_mut(&row.id) {
+            *score += contribution;
+        } else {
+            let kind = parse_kind_str(&row.kind);
+            let result = SearchResult {
+                id: row.id,
+                content: row.content,
+                kind,
+                importance: row.importance,
+                strength: row.strength,
+                t_valid: row.t_valid,
+                t_invalid: row.t_invalid,
+                t_created: row.t_created,
+                entity_refs: row.entity_refs,
+                score: 0.0,
+                graph_context: vec![],
+                version_history: vec![],
+            };
+            scores.entry(row.id).or_insert((result, contribution));
+        }
+    }
+
     let mut results: Vec<SearchResult> = scores
         .into_values()
         .map(|(mut r, score)| {
@@ -848,7 +1180,7 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
     // Extract temporal reference from query (if any)
     let temporal_ref = extraction::extract_temporal(&query.query);
 
-    // Fan out all four searches — FTS may return nothing if query has no meaningful terms
+    // Fan out all five searches — FTS may return nothing if query has no meaningful terms
     let fts_future = async {
         if terms.is_empty() {
             Ok(vec![])
@@ -864,13 +1196,24 @@ pub async fn search_hybrid<E: EmbeddingProvider>(
             None => Ok(vec![]),
         }
     };
+    let spreading_future = spreading_activation_search(pool, &query);
 
-    let (fts_results, vec_results, graph_results, temporal_results) =
-        tokio::try_join!(fts_future, vec_future, graph_future, temporal_future)?;
+    let (fts_results, vec_results, graph_results, temporal_results, spreading_results) = tokio::try_join!(
+        fts_future,
+        vec_future,
+        graph_future,
+        temporal_future,
+        spreading_future
+    )?;
 
-    // Merge all four signals via RRF
-    let mut results =
-        fuse_hybrid_results(fts_results, vec_results, graph_results, temporal_results);
+    // Merge all five signals via RRF
+    let mut results = fuse_hybrid_results(
+        fts_results,
+        vec_results,
+        graph_results,
+        temporal_results,
+        spreading_results,
+    );
 
     // Preference boost
     if is_pref_query {
@@ -982,7 +1325,7 @@ mod tests {
             },
         ];
 
-        let results = fuse_hybrid_results(rows, vec![], vec![], vec![]);
+        let results = fuse_hybrid_results(rows, vec![], vec![], vec![], vec![]);
         assert!(
             results[0].score > results[1].score,
             "first should score higher: {} vs {}",
@@ -1027,14 +1370,14 @@ mod tests {
 
     #[test]
     fn fuse_hybrid_both_empty_returns_empty() {
-        let results = fuse_hybrid_results(vec![], vec![], vec![], vec![]);
+        let results = fuse_hybrid_results(vec![], vec![], vec![], vec![], vec![]);
         assert!(results.is_empty());
     }
 
     #[test]
     fn fuse_hybrid_fts_only_appears() {
         let id = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![], vec![], vec![]);
+        let results = fuse_hybrid_results(vec![make_fts(id, 0.8)], vec![], vec![], vec![], vec![]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
         assert!(results[0].score > 0.0);
@@ -1043,7 +1386,7 @@ mod tests {
     #[test]
     fn fuse_hybrid_vector_only_appears() {
         let id = Uuid::new_v4();
-        let results = fuse_hybrid_results(vec![], vec![make_vec(id, 0.1)], vec![], vec![]);
+        let results = fuse_hybrid_results(vec![], vec![make_vec(id, 0.1)], vec![], vec![], vec![]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
         assert!(results[0].score > 0.0);
@@ -1056,6 +1399,7 @@ mod tests {
         let results = fuse_hybrid_results(
             vec![make_fts(id, 0.8)],
             vec![make_vec(id, 0.1)],
+            vec![],
             vec![],
             vec![],
         );
@@ -1079,6 +1423,7 @@ mod tests {
             vec![make_vec(a, 0.1)], // only A has a vector match
             vec![],
             vec![],
+            vec![],
         );
         assert_eq!(results.len(), 2);
         let score_a = results.iter().find(|r| r.id == a).unwrap().score;
@@ -1098,7 +1443,7 @@ mod tests {
             .enumerate()
             .map(|(i, id)| make_fts(*id, 1.0 - i as f32 * 0.2))
             .collect();
-        let results = fuse_hybrid_results(fts, vec![], vec![], vec![]);
+        let results = fuse_hybrid_results(fts, vec![], vec![], vec![], vec![]);
         for w in results.windows(2) {
             assert!(
                 w[0].score >= w[1].score,
@@ -1117,6 +1462,7 @@ mod tests {
         let results = fuse_hybrid_results(
             vec![],
             vec![make_vec(close, 0.01), make_vec(far, 0.99)],
+            vec![],
             vec![],
             vec![],
         );
@@ -1142,7 +1488,8 @@ mod tests {
         fts_decayed.strength = 0.1;
         fts_decayed.importance = 0.5;
 
-        let results = fuse_hybrid_results(vec![fts_fresh, fts_decayed], vec![], vec![], vec![]);
+        let results =
+            fuse_hybrid_results(vec![fts_fresh, fts_decayed], vec![], vec![], vec![], vec![]);
         let s_fresh = results.iter().find(|r| r.id == fresh).unwrap().score;
         let s_decayed = results.iter().find(|r| r.id == decayed).unwrap().score;
         assert!(
